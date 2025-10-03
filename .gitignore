@@ -3,3 +3,4 @@ Cargo.lock
 *.manifest.sgx
 *.manifest.template
 *.sig
+wasm_module/*.wasm

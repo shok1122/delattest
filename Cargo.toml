@@ -1,13 +1,11 @@
-# Copyright (C) 2023 Gramine contributors
-# SPDX-License-Identifier: BSD-3-Clause
-
 [package]
-name = "delattest"
+name = "wasm-executor-server"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 hyper = { version = "0.14", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
+# より安定したバージョンを使用
+wasmtime = "15.0"
+wasmtime-wasi = "15.0"

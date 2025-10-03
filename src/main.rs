@@ -1,31 +1,40 @@
 // Copyright (C) 2023 Gramine contributors
 // SPDX-License-Identifier: BSD-3-Clause
-
-// Standard library imports
-use std::convert::Infallible; // Used for functions that cannot fail
-use std::net::SocketAddr;     // Used to represent an IP address and port
-// HTTP library for Rust
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use hyper::{Body, Request, Response, Server, Method, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
+use wasmtime::*;
 
-// Embed the contents of "usage.txt" directly into the binary at compile time.
-// This avoids reading files at runtime and makes deployment simpler.
-const USAGE_TEXT: &str = include_str!("./usage.txt");
+const USAGE_TEXT: &str = r#"HTTP Logger Server with WASM Execution
 
-// Asynchronous request handler.
-// Receives an HTTP request and produces an HTTP response.
-// The `Infallible` error type means this function *always* return `Ok(...)`
-// (any error is translated into a valid HTTP response).
+Usage:
+  POST /log          - Log text message to server console
+  POST /execute-wasm - Execute WASM binary
+  GET  /             - Show this usage information
+
+Examples:
+  # Log a message
+  curl -X POST http://localhost:3000/log -d "Hello from client!"
+  
+  # Execute WASM binary
+  curl -X POST http://localhost:3000/execute-wasm \
+       --data-binary @hello.wasm \
+       -H "Content-Type: application/wasm"
+
+WASM Compilation Examples:
+  # C: clang --target=wasm32-wasi -o hello.wasm hello.c
+  # Rust: cargo build --target wasm32-wasi --release
+  # Go: GOOS=wasip1 GOARCH=wasm go build -o hello.wasm main.go
+"#;
+
 async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     match (req.method(), req.uri().path()) {
-        // === Handle POST /log requests ===
-        // The client sends a text payload that is printed to stdout.
+        // POST /log エンドポイントで文字列を受け取る
         (&Method::POST, "/log") => {
-            // Attempt to read the request body into bytes.
             let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    // If the body cannot be read, log the error and return HTTP 400.
                     eprintln!("Error reading request body: {}", e);
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_REQUEST)
@@ -34,11 +43,9 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
                 }
             };
 
-            // Attempt to interpret the bytes as UTF-8 text.
             let body_str = match std::str::from_utf8(&body_bytes) {
                 Ok(s) => s,
                 Err(e) => {
-                    // If decoding fails, log the error and return HTTP 400.
                     eprintln!("Error parsing UTF-8: {}", e);
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_REQUEST)
@@ -47,22 +54,49 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
                 }
             };
 
-            // Print the received message to the server's stdout (server-side log).
+            // サーバー側のログに出力
             println!("[LOG] Received message: {}", body_str);
             
-            // Respond to the client with a success message.
             Ok(Response::new("Message logged successfully".into()))
         }
         
-        // === Handle Get / requests ===
-        // Provide a usage/help message to the client
+        // POST /execute-wasm エンドポイントでWASMバイナリを受け取って実行
+        (&Method::POST, "/execute-wasm") => {
+            let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("Error reading WASM binary: {}", e);
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body("Failed to read WASM binary".into())
+                        .unwrap());
+                }
+            };
+
+            println!("[WASM] Received WASM binary ({} bytes)", body_bytes.len());
+            
+            // WASM実行
+            match execute_wasm(&body_bytes).await {
+                Ok(output) => {
+                    println!("[WASM] Execution successful");
+                    Ok(Response::new(format!("WASM executed successfully\n\nResult: {}", output).into()))
+                }
+                Err(e) => {
+                    eprintln!("[WASM] Execution failed: {}", e);
+                    Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(format!("WASM execution failed: {}", e).into())
+                        .unwrap())
+                }
+            }
+        }
+        
+        // GET / エンドポイントで使用方法を説明
         (&Method::GET, "/") => {
-            // Use the embedded text file as the response.
             Ok(Response::new(USAGE_TEXT.into()))
         }
         
-        // === Handle all other requests ===
-        // Any unsupported path or method returns a 404 Not Found.
+        // その他のリクエストに対しては404を返す
         _ => {
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -72,11 +106,53 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
     }
 }
 
-// By default, tokio spawns as many threads as there are CPU cores. This is undesirable,
-// because you need to specify in the Gramine manifest the maximal number of threads per
-// process, and ideally this wouldn't depend on your hardware.
-//
-// See sgx.max_threads in the manifest.
+async fn execute_wasm(wasm_bytes: &[u8]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Wasmtimeエンジンの作成
+    let engine = Engine::default();
+    let module = Module::new(&engine, wasm_bytes)?;
+    
+    // WASI設定を含むStoreの作成
+    let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+        .inherit_stdio()
+        .inherit_args()
+        .build();
+    let mut store = Store::new(&engine, wasi);
+    
+    // リンカーの作成とWASI関数の追加
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::add_to_linker(&mut linker, |s| s)?;
+    
+    // WASMモジュールのインスタンス化
+    let instance = linker.instantiate(&mut store, &module)?;
+    
+    // _start関数を実行（WASIの標準エントリポイント）
+    if let Ok(start_func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+        match start_func.call(&mut store, ()) {
+            Ok(()) => {
+                return Ok("WASM _start function executed successfully".to_string());
+            }
+            Err(trap) => {
+                // トラップでもある程度の情報を返す
+                return Ok(format!("WASM executed but ended with trap: {}", trap));
+            }
+        }
+    }
+    
+    // main関数を実行
+    if let Ok(main_func) = instance.get_typed_func::<(), i32>(&mut store, "main") {
+        match main_func.call(&mut store, ()) {
+            Ok(return_code) => {
+                return Ok(format!("WASM main function executed, returned: {}", return_code));
+            }
+            Err(trap) => {
+                return Err(format!("WASM main function trap: {}", trap).into());
+            }
+        }
+    }
+    
+    Err("No suitable entry function (_start or main) found in WASM module".into())
+}
+
 #[tokio::main(worker_threads = 4)]
 async fn main() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
@@ -88,11 +164,10 @@ async fn main() {
     let server = Server::bind(&addr).serve(make_service);
     
     println!("Server running on http://{}", addr);
-    println!("Send POST requests to /log with text data");
+    println!("WASI-enabled WASM executor ready!");
     
     if let Err(e) = server.await {
         eprintln!("server error: {}", e);
         std::process::exit(1);
     }
 }
-
