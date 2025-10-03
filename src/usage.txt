@@ -1,0 +1,19 @@
+HTTP Logger Server
+
+Usage:
+  POST /log
+  Content-Type: text/plain
+  Body: Your message here
+
+Examples:
+  curl -X POST http://localhost:3000/log -d "Hello from client!"
+  
+  echo "Test message" | http POST localhost:3000/log
+  
+  # Using HTTPie
+  http POST localhost:3000/log Content-Type:text/plain < message.txt
+
+Endpoints:
+  GET  /       - Show this usage information
+  POST /log    - Log the request body to server console
+
