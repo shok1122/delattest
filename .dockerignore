@@ -1,0 +1,13 @@
+# ビルドコンテキストを極力小さくしてキャッシュ効率UP
+docker
+scripts
+target
+wasm_module
+.git
+**/target
+**/*.rs.bk
+**/*.log
+**/*.tmp
+.DS_Store
+.env
+

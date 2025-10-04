@@ -7,6 +7,20 @@ ARCH_LIBDIR ?= /lib/$(shell $(CC) -dumpmachine)
 
 SELF_EXE = target/release/$(APP)
 
+.PHONY: builder
+builder:
+	docker build --target builder -t rust-sgx-builder .
+
+.PHONY: runner
+runner:
+	docker build --target runtime -t rust-sgx-runner .
+
+.PHONY: gen-carg-lock
+gen-cargo-lock:
+	rm -f Cargo.lock
+	docker run --rm -v .:/work -w /work rust:1.86-slim \
+		cargo generate-lockfile
+
 .PHONY: all
 all: $(SELF_EXE) $(APP).manifest
 ifeq ($(SGX),1)

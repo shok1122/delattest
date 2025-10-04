@@ -1,11 +1,19 @@
 [package]
-name = "wasm-executor-server"
+name = "wasm-runner"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hyper = { version = "0.14", features = ["full"] }
-tokio = { version = "1", features = ["full"] }
-# より安定したバージョンを使用
-wasmtime = "15.0"
-wasmtime-wasi = "15.0"
+anyhow = "1"
+
+# Hyper 1.x 系
+hyper = { version = "1.7", features = ["http1"] }
+hyper-util = { version = "0.1.17", features = ["server", "tokio", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
+
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "time"] }
+
+# Wasmtime 36（LTS） + WASI Preview 2
+wasmtime = { version = "36", features = ["component-model", "async"] }
+wasmtime-wasi = "36"
