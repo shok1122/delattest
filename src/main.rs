@@ -8,6 +8,7 @@ use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use http_body_util::{Full, BodyExt};
 use std::{convert::Infallible, net::SocketAddr};
 use tokio::net::TcpListener;
+use tokio::select;
 
 // Wasmtime (Component Model / WASI Preview2)
 use wasmtime::{Config, Engine, component::{Component, Linker}};
@@ -31,7 +32,7 @@ impl WasiView for Ctx {
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
     let addr: SocketAddr = format!("{}:{}", host, port).parse().expect("invalid HOST/PORT");
@@ -40,18 +41,27 @@ async fn main() -> Result<()> {
     println!("listening on http://{}", addr);
 
     use hyper_util::rt::TokioIo;
-    loop {
-        let (io, _peer) = listener.accept().await?;
-        tokio::spawn(async move {
-            let svc = service_fn(router);
-            let io = TokioIo::new(io);
-            let builder = AutoBuilder::new(TokioExecutor::new());
-            let conn = builder.serve_connection(io, svc);
-            if let Err(e) = conn.await {
-                eprintln!("server error: {e}");
+    select! {
+        _ = async {
+            loop {
+                let (io, _peer) = listener.accept().await?;
+                tokio::spawn(async move {
+                    let svc = service_fn(router);
+                    let io = TokioIo::new(io);
+                    let builder = AutoBuilder::new(TokioExecutor::new());
+                    let conn = builder.serve_connection(io, svc);
+                    if let Err(e) = conn.await {
+                        eprintln!("server error: {e}");
+                    }
+                });
             }
-        });
+            Ok::<(), anyhow::Error>(())
+        } =>{},
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("Ctrl+C received. stopping the servet");
+        }
     }
+    Ok(())
 }
 
 async fn router(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {

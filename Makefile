@@ -15,6 +15,10 @@ builder:
 runner:
 	docker build --target runtime -t rust-sgx-runner .
 
+.PHONY: run
+run:
+	docker run --rm -p 3000:3000 rust-sgx-runner
+
 .PHONY: gen-carg-lock
 gen-cargo-lock:
 	rm -f Cargo.lock
@@ -59,9 +63,9 @@ else
 GRAMINE = gramine-sgx
 endif
 
-.PHONY: start-gramine-server
-run: all
-	$(GRAMINE) $(APP)
+#.PHONY: start-gramine-server
+#run: all
+#	$(GRAMINE) $(APP)
 
 .PHONY: clean
 clean:
