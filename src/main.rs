@@ -10,26 +10,10 @@ use std::{convert::Infallible, net::SocketAddr};
 use tokio::net::TcpListener;
 use tokio::select;
 
-// Wasmtime (Component Model / WASI Preview2)
-use wasmtime::{Config, Engine, component::{Component, Linker}};
-use wasmtime::Store;
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi::p2::bindings::Command;
-use wasmtime::component::ResourceTable;
-
-#[derive(Default)]
-struct Ctx {
-    wasi: WasiCtx,
-    table: ResourceTable,
-}
-impl WasiView for Ctx {
-    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
-        wasmtime_wasi::WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
-    }
-}
+// Wasmtime (Core Module用 - WASI Preview 1)
+use wasmtime::{Config, Engine, Module, Linker, Store};
+use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::preview1::{WasiP1Ctx, add_to_linker_async};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -42,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
 
     use hyper_util::rt::TokioIo;
     select! {
-        _ = async {
+        res = async {
             loop {
                 let (io, _peer) = listener.accept().await?;
                 tokio::spawn(async move {
@@ -55,10 +39,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
+            #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
-        } =>{},
+        } => {
+            res?;
+        },
         _ = tokio::signal::ctrl_c() => {
-            eprintln!("Ctrl+C received. stopping the servet");
+            eprintln!("Ctrl+C received. stopping the server");
         }
     }
     Ok(())
@@ -70,7 +57,7 @@ async fn router(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infalli
 
     let resp = match (method, path.as_str()) {
         (Method::GET, "/") => {
-            ok_text("OK: POST /execute-wasm (body = WASI Preview2 component)")
+            ok_text("OK: POST /execute-wasm (body = WASI Core Module)")
         }
         (Method::POST, "/execute-wasm") => {
             match handle_execute_wasm(req).await {
@@ -91,6 +78,7 @@ fn ok_text<S: Into<String>>(s: S) -> Response<Full<Bytes>> {
         .body(Full::from(Bytes::from(s.into())))
         .unwrap()
 }
+
 fn err_text<S: Into<String>>(code: StatusCode, s: S) -> Response<Full<Bytes>> {
     Response::builder()
         .status(code)
@@ -100,38 +88,34 @@ fn err_text<S: Into<String>>(code: StatusCode, s: S) -> Response<Full<Bytes>> {
 }
 
 async fn handle_execute_wasm(req: Request<Incoming>) -> Result<String> {
-    // リクエストボディを全部読み込み（Hyper 1.x では BodyExt::collect → to_bytes）
     let bytes = req.into_body().collect().await?.to_bytes();
 
-    // Wasmtime エンジン（Component Model + async）
+    // Wasmtime エンジン（Core Module用、async対応）
     let mut cfg = Config::new();
-    cfg.wasm_component_model(true).async_support(true);
+    cfg.async_support(true);
     let engine = Engine::new(&cfg)?;
 
-    // 受け取った .wasm は「WASI Preview2 component」を想定
-    let component = Component::from_binary(&engine, &bytes)?;
+    // Core WASM Module として読み込む
+    let module = Module::from_binary(&engine, &bytes)?;
 
-    // Linker に WASI P2 を追加（async 版）
-    let mut linker: Linker<Ctx> = Linker::new(&engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?; // sync 版もあり。用途で選択。 [oai_citation:5‡Wasmtime](https://docs.wasmtime.dev/api/wasmtime_wasi/p2/fn.add_to_linker_sync.html?utm_source=chatgpt.com)
+    // Linker に WASI Preview1 を追加
+    let mut linker = Linker::new(&engine);
+    add_to_linker_async(&mut linker, |t: &mut WasiP1Ctx| t)?;
 
-    // 実行コンテキスト（stdio/args などは適宜調整）
+    // WASIコンテキスト作成（Preview 1用）
     let wasi = WasiCtxBuilder::new()
         .inherit_stdio()
         .inherit_args()
-        .build();
+        .build_p1();
 
-    let mut store = Store::new(&engine, Ctx { 
-        wasi,
-        table: ResourceTable::new(),
-    });
+    let mut store = Store::new(&engine, wasi);
 
-    // `wasi:cli/command` の run() を呼ぶ
-    let cmd = Command::instantiate_async(&mut store, &component, &linker).await?;
-    let result = cmd.wasi_cli_run().call_run(&mut store).await?;
+    // インスタンス化
+    let instance = linker.instantiate_async(&mut store, &module).await?;
+    
+    // _start 関数を呼び出し（WASIのエントリポイント）
+    let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
+    start.call_async(&mut store, ()).await?;
 
-    match result {
-        Ok(()) => Ok("component finished successfully".to_string()),
-        Err(()) => Ok("component finished with error".to_string()),
-    }
+    Ok("WASM module executed successfully".to_string())
 }
