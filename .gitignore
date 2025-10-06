@@ -4,3 +4,6 @@ Cargo.lock
 *.manifest.template
 *.sig
 wasm_module/*.wasm
+**/cache/*
+
+!.gitkeep

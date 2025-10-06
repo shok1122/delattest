@@ -32,6 +32,12 @@ test:
 		-H "Content-Type: application/wasm" \
 		--data-binary @../wasm_module/hello.wasm
 
+.PHONY: extract
+extract:
+	docker create --name tmp rust-sgx-builder
+	docker cp tmp:/build/target/x86_64-unknown-linux-musl/release/wasm-runner ./cache
+	docker rm tmp
+
 .PHONY: gen-carg-lock
 gen-cargo-lock:
 	rm -f Cargo.lock
