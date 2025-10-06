@@ -17,7 +17,20 @@ runner:
 
 .PHONY: run
 run:
-	docker run --rm -p 3000:3000 rust-sgx-runner
+	docker run -d --rm \
+		-p 3000:3000 \
+		--name wasm-runner \
+		rust-sgx-runner
+
+.PHONY: stop
+stop:
+	docker stop wasm-runner
+
+.PHONY: test
+test:
+	curl -X POST http://localhost:3000/execute-wasm \
+		-H "Content-Type: application/wasm" \
+		--data-binary @wasm_module/hello.wasm
 
 .PHONY: gen-carg-lock
 gen-cargo-lock:
