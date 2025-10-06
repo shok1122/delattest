@@ -93,6 +93,20 @@ async fn handle_execute_wasm(req: Request<Incoming>) -> Result<String> {
 
     let mut cfg = Config::new();
     cfg.async_support(true);
+
+    // ★ 重要: 巨大な仮想領域予約を止める
+    // 予約サイズを小さく（例: 1 MiB）。初期サイズがこれより大きいとこの値は無視されます
+    cfg.memory_reservation(1 * 1024 * 1024);
+    // 成長用の追加予約も小さく（例: 16 MiB）
+    cfg.memory_reservation_for_growth(16 * 1024 * 1024);
+    // ガードページを使わない（予約をさらに節約）
+    cfg.memory_guard_size(0);
+    cfg.guard_before_linear_memory(false);
+    // 必要に応じて：成長時にメモリ移動を許可（予約が尽きたら移動）
+    cfg.memory_may_move(true);
+    // 64-bit メモリは無効のまま（既定で false）
+    cfg.wasm_memory64(false);
+
     let engine = Engine::new(&cfg)?;
     let module = Module::from_binary(&engine, &bytes)?;
 
