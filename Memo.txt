@@ -1,0 +1,3 @@
+- WASMを送信して実行する機能を実装した（Gramine-SGXで動作することを確認済み）
+  - SGX=1 make run で実行（Gramine-SGX）
+  - clientから make test SRC=hello1 で動作確認可能
