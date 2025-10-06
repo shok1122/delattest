@@ -14,6 +14,7 @@ use tokio::select;
 use wasmtime::{Config, Engine, Module, Linker, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::preview1::{WasiP1Ctx, add_to_linker_async};
+use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -90,32 +91,36 @@ fn err_text<S: Into<String>>(code: StatusCode, s: S) -> Response<Full<Bytes>> {
 async fn handle_execute_wasm(req: Request<Incoming>) -> Result<String> {
     let bytes = req.into_body().collect().await?.to_bytes();
 
-    // Wasmtime エンジン（Core Module用、async対応）
     let mut cfg = Config::new();
     cfg.async_support(true);
     let engine = Engine::new(&cfg)?;
-
-    // Core WASM Module として読み込む
     let module = Module::from_binary(&engine, &bytes)?;
 
-    // Linker に WASI Preview1 を追加
     let mut linker = Linker::new(&engine);
     add_to_linker_async(&mut linker, |t: &mut WasiP1Ctx| t)?;
 
-    // WASIコンテキスト作成（Preview 1用）
+    // ★ 容量は十分に（例: 1MB）。0 は “無制限” ではありません
+    let stdout_pipe = MemoryOutputPipe::new(1 * 1024 * 1024);
+    let stderr_pipe = MemoryOutputPipe::new(1 * 1024 * 1024);
+
+    // ★ 読み取り用ハンドルをここで clone して保持（同一バッファを共有）
+    let stdout_reader = stdout_pipe.clone();
+    let stderr_reader = stderr_pipe.clone();
+
     let wasi = WasiCtxBuilder::new()
-        .inherit_stdio()
-        .inherit_args()
+        .stdout(stdout_pipe)  // ← 本体を move
+        .stderr(stderr_pipe)  // ← 本体を move
         .build_p1();
 
     let mut store = Store::new(&engine, wasi);
-
-    // インスタンス化
     let instance = linker.instantiate_async(&mut store, &module).await?;
-    
-    // _start 関数を呼び出し（WASIのエントリポイント）
     let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     start.call_async(&mut store, ()).await?;
 
-    Ok("WASM module executed successfully".to_string())
+    // ★ 実行完了後に “reader” 側から中身を読む
+    let out = String::from_utf8_lossy(&stdout_reader.contents()).to_string();
+    let err = String::from_utf8_lossy(&stderr_reader.contents()).to_string();
+
+    Ok(if err.is_empty() { out } else { format!("-- stdout --\n{out}\n\n-- stderr --\n{err}") })
 }
+
