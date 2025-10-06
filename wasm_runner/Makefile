@@ -38,6 +38,10 @@ extract:
 	docker cp tmp:/build/target/x86_64-unknown-linux-musl/release/wasm-runner ./cache
 	docker rm tmp
 
+.PHONY: upload
+upload: extract
+	scp ./cache/wasm-runner delattest:~/dev/delattest/cache/wasm-runner
+
 .PHONY: gen-carg-lock
 gen-cargo-lock:
 	rm -f Cargo.lock
