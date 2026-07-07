@@ -1,45 +1,39 @@
-# Copyright (C) 2023 Gramine contributors
-# SPDX-License-Identifier: BSD-3-Clause
-
-APP = delattest
-
-ARCH_LIBDIR ?= /lib/$(shell $(CC) -dumpmachine)
-
-SELF_EXE = target/release/$(APP)
+APP = wasm-runner
 
 .PHONY: builder
 builder:
-	docker build --target builder -t rust-sgx-builder .
+	docker build --target builder -t wasm-runner-builder .
 
 .PHONY: runner
 runner:
-	docker build --target runtime -t rust-sgx-runner .
+	docker build --target runtime -t wasm-runner-runtime .
 
 .PHONY: run
 run:
 	docker run -d --rm \
 		-p 3000:3000 \
 		--name wasm-runner \
-		rust-sgx-runner
+		wasm-runner-runtime
 
 .PHONY: stop
 stop:
 	docker stop wasm-runner
 
 .PHONY: extract
-extract:
-	docker create --name tmp rust-sgx-builder
-	docker cp tmp:/build/target/x86_64-unknown-linux-musl/release/wasm-runner ./cache
+extract: builder
+	docker create --name tmp wasm-runner-builder
+	docker cp tmp:/build/bin/$(APP) ./cache/$(APP)
 	docker rm tmp
+	sudo chown $(shell whoami):$(shell whoami) ./cache/$(APP)
+
+.PHONY: install
+install: extract
+	cp ./cache/$(APP) ../cache/$(APP)
 
 .PHONY: upload
 upload: extract
-	scp ./cache/wasm-runner delattest:~/dev/delattest/cache/wasm-runner
+	scp ./cache/$(APP) delattest:~/dev/delattest/cache/$(APP)
 
-.PHONY: gen-carg-lock
-gen-cargo-lock:
-	rm -f Cargo.lock
-	docker run --rm -v .:/work -w /work rust:1.86-slim \
-		cargo generate-lockfile
-
-
+.PHONY: gen-go-sum
+gen-go-sum:
+	docker run --rm -v .:/work -w /work golang:1.25-bookworm go mod tidy

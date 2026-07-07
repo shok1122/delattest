@@ -6,7 +6,7 @@ WASM モジュールを HTTP 経由で受け取り、Gramine-SGX のエンクレ
 ## 構成
 
 ```
-wasm_runner/        wasm-runner 本体（Rust, hyper + wasmtime）。Docker(musl)でビルド
+wasm_runner/        wasm-runner 本体（Go, net/http + wazero）。Dockerでビルド（CGO無効の静的バイナリ）
 wasm_module/        動作確認用の WASM モジュール（hello1, hello2 など, wasi-sdk でビルド）
 Makefile            リポジトリ直下。gramine-manifest / gramine-sgx-sign / 実行を行う
 wasm-runner.manifest.template   Gramine マニフェストのテンプレート（リポジトリ管理下）
@@ -60,29 +60,22 @@ sudo usermod -aG docker $(whoami)   # 反映には再ログイン or `sg docker`
 
 ### 4. wasm-runner バイナリのビルド
 
-`wasm_runner/` は musl 静的リンクでビルドする Rust プロジェクト。Cargo.lock も
-`.gitignore` 対象なので無ければ生成する。
+`wasm_runner/` は CGO 無効（`CGO_ENABLED=0`）の静的バイナリとしてビルドする Go
+プロジェクト。依存は `go.mod` / `go.sum` としてリポジトリ管理下にあるため、
+事前生成の手順は不要。
 
 ```sh
 cd wasm_runner
 
-# Cargo.lock が無ければ生成
-[ -f Cargo.lock ] || docker run --rm -v .:/work -w /work rust:1.86-slim \
-  cargo generate-lockfile
+# ビルド → バイナリ取り出し → リポジトリ直下の cache/ に配置（root Makefile が参照する場所）
+make install
 
-# ビルド用イメージを作成してビルド（数分〜10分程度）
-docker build --target builder -t rust-sgx-builder .
-
-# ビルド済みバイナリを取り出す
-docker create --name tmp-extract rust-sgx-builder
-docker cp tmp-extract:/build/target/x86_64-unknown-linux-musl/release/wasm-runner ./cache/wasm-runner
-docker rm tmp-extract
-sudo chown $(whoami):$(whoami) ./cache/wasm-runner
-
-# リポジトリ直下の cache/ に配置（root Makefile が参照する場所）
-cp ./cache/wasm-runner ../cache/wasm-runner
 cd ..
 ```
+
+`make install` は内部で `docker build --target builder`（`make builder`）→
+`docker cp` によるバイナリ取り出し（`make extract`）→ `../cache/` への配置、を
+まとめて実行する。
 
 ### 5. マニフェスト生成・署名・実行
 

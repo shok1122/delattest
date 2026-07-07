@@ -3,8 +3,9 @@ libos.entrypoint = "{{ self_exe }}"
 loader.log_level = "{{ log_level }}"
 
 loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}"
-loader.env.MALLOC_ARENA_MAX = "1"
-loader.env.RUST_BACKTRACE = "full"
+# GoランタイムのP(論理プロセッサ)数を制限し、OSスレッド生成量を抑える
+# （sgx.max_threadsの余裕を確保するため）
+loader.env.GOMAXPROCS = "4"
 
 fs.mounts = [
   { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
@@ -14,12 +15,19 @@ fs.mounts = [
 sgx.debug = true
 sgx.edmm_enable = false
 sgx.use_exinfo = false
-sgx.max_threads = 8
+# Goランタイムはsysmon/GC/シグナルハンドリング等で起動直後から複数のOSスレッドを
+# 常時使うため、Rust版で足りていた8では "no available TCS pages" エラーになった。
+# 実測で余裕を持たせて32に設定（負荷次第でさらに増やす必要が出る可能性あり）
+sgx.max_threads = 32
 sgx.isvprodid = 0
 sgx.isvsvn = 0
 sgx.remote_attestation = "none"
 sgx.enable_stats = false
-sgx.enclave_size = "256M"
+# Goランタイムはヒープのページ管理用に、実ヒープ使用量とは無関係に起動時から
+# 大きめの仮想アドレス空間を予約する。Rust版で足りていた256MではGoの初期化が
+# "failed to reserve page summary memory" で失敗したため2Gまで拡大した
+# （sgx.enclave_sizeは2のべき乗である必要がある）
+sgx.enclave_size = "2G"
 
 sgx.trusted_files = [
   "file:{{ self_exe }}",
