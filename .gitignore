@@ -1,7 +1,7 @@
 target
 Cargo.lock
+*.manifest
 *.manifest.sgx
-*.manifest.template
 *.sig
 **/*.wasm
 **/cache/*

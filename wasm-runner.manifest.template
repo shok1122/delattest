@@ -1,0 +1,28 @@
+libos.entrypoint = "{{ self_exe }}"
+
+loader.log_level = "{{ log_level }}"
+
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}"
+loader.env.MALLOC_ARENA_MAX = "1"
+loader.env.RUST_BACKTRACE = "full"
+
+fs.mounts = [
+  { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
+  { path = "{{ arch_libdir }}", uri = "file:{{ arch_libdir }}" },
+]
+
+sgx.debug = true
+sgx.edmm_enable = false
+sgx.use_exinfo = false
+sgx.max_threads = 8
+sgx.isvprodid = 0
+sgx.isvsvn = 0
+sgx.remote_attestation = "none"
+sgx.enable_stats = false
+sgx.enclave_size = "256M"
+
+sgx.trusted_files = [
+  "file:{{ self_exe }}",
+  "file:{{ gramine.runtimedir() }}/",
+  "file:{{ arch_libdir }}/",
+]
