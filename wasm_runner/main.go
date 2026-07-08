@@ -24,12 +24,14 @@ import (
 const outputCap = 1 * 1024 * 1024
 
 func main() {
+	// WASMランナーサーバで使うアドレスの決定
 	host := getEnv("HOST", "0.0.0.0")
 	port := getEnv("PORT", "3000")
 	addr := net.JoinHostPort(host, port)
 
+	// サーバを goroutine で起動
+	// router がリクエストを振り分けるハンドラ
 	srv := &http.Server{Addr: addr, Handler: http.HandlerFunc(router)}
-
 	go func() {
 		log.Printf("listening on http://%s", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -37,11 +39,13 @@ func main() {
 		}
 	}()
 
+	// シグナル待ち受け
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	log.Println("Ctrl+C received. stopping the server")
 
+	// Graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
@@ -56,8 +60,10 @@ func getEnv(key, def string) string {
 
 func router(w http.ResponseWriter, r *http.Request) {
 	switch {
+	// ヘルスチェック --- GET /
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		okText(w, http.StatusOK, "OK: POST /execute-wasm (body = WASI Core Module)")
+	// メイン --- POST /execute-wasm
 	case r.Method == http.MethodPost && r.URL.Path == "/execute-wasm":
 		text, err := handleExecuteWasm(r)
 		if err != nil {
@@ -77,38 +83,46 @@ func okText(w http.ResponseWriter, code int, s string) {
 }
 
 func handleExecuteWasm(r *http.Request) (string, error) {
+	// リクエストボディ（WASMバイナリ）の読み込み
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return "", err
 	}
 	defer r.Body.Close()
 
+	// wazeroランタイムの生成
 	ctx := context.Background()
 	runtime := wazero.NewRuntime(ctx)
 	defer runtime.Close(ctx)
 
+	// WASI（WebAssembly System Interface）のセットアップ
 	if _, err := wasi_snapshot_preview1.Instantiate(ctx, runtime); err != nil {
 		return "", err
 	}
 
+	// WASMバイナリをWASMモジュールとしてコンパイル
 	compiled, err := runtime.CompileModule(ctx, body)
 	if err != nil {
 		return "", err
 	}
 
+	// 出力バッファの用意
 	stdout := newCappedBuffer(outputCap)
 	stderr := newCappedBuffer(outputCap)
-
 	config := wazero.NewModuleConfig().
 		WithStdout(stdout).
 		WithStderr(stderr)
 
+	// モジュールの実行
 	mod, err := runtime.InstantiateModule(ctx, compiled, config)
 	if mod != nil {
 		defer mod.Close(ctx)
 	}
+
+	// 終了処理
 	if err != nil {
 		var exitErr *sys.ExitError
+		// WASIプログラムが正常終了する際，wazero上ではエラーとして返ってくるので，それを判定
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 0 {
 			// _start called proc_exit(0); not an error.
 		} else {
@@ -116,6 +130,7 @@ func handleExecuteWasm(r *http.Request) (string, error) {
 		}
 	}
 
+	// 結果の整形
 	out := stdout.String()
 	errOut := stderr.String()
 	if errOut == "" {
