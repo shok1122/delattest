@@ -19,11 +19,17 @@ else
 GRAMINE_LOG_LEVEL = error
 endif
 
+# 削除証明にSGX quoteを含める場合は RA_TYPE=dcap を指定（要: ホスト側DCAPスタック）
+RA_TYPE ?= none
+
+# 注意: SGX/RA_TYPE を切り替えるときは `make clean` してからマニフェストを再生成すること
 $(APP).manifest: $(APP).manifest.template
 	gramine-manifest \
 		-Dlog_level=$(GRAMINE_LOG_LEVEL) \
 		-Darch_libdir=$(ARCH_LIBDIR) \
 		-Dself_exe=$(SELF_EXE) \
+		-Dsgx=$(SGX) \
+		-Dra_type=$(RA_TYPE) \
 		$< $@
 
 $(APP).manifest.sgx $(APP).sig &: $(APP).manifest
@@ -39,6 +45,7 @@ endif
 
 .PHONY: run
 run:
+	@mkdir -p data_store
 	$(GRAMINE) $(APP)
 
 .PHONY: clean

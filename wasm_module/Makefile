@@ -1,4 +1,4 @@
-SUBDIRS := hello1 hello2
+SUBDIRS := hello1 hello2 readinput
 ifeq ($(SRC),)
     TARGET_DIRS := $(SUBDIRS)
 else

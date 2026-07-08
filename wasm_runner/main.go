@@ -1,27 +1,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
-
-	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
-	"github.com/tetratelabs/wazero/sys"
 )
-
-// outputCap bounds how much stdout/stderr we buffer from a running module,
-// mirroring the fixed-capacity pipes used by the previous Rust implementation.
-const outputCap = 1 * 1024 * 1024
 
 func main() {
 	// WASMランナーサーバで使うアドレスの決定
@@ -29,11 +19,40 @@ func main() {
 	port := getEnv("PORT", "3000")
 	addr := net.JoinHostPort(host, port)
 
+	// 封印ストレージの初期化（§6.2）
+	// Gramine実行時は DATA_DIR が encrypted mount（Protected Files）を指すため、
+	// ホスト上のファイルはすべて暗号化された状態でしか存在しない
+	dataDir := getEnv("DATA_DIR", "data_store")
+	st, err := newStore(dataDir)
+	if err != nil {
+		log.Fatalf("storage init error: %v", err)
+	}
+
+	// 削除証明の発行モジュール（§6.4）。起動時に署名鍵を生成し、
+	// 公開鍵ハッシュを埋め込んだ quote を一度だけ取得する（§9.3）
+	pr := newProver()
+
+	// ライフサイクル管理の初期化（§6.1）。永続化済みメタデータの読み込みと
+	// 中断された削除処理のリカバリを行う
+	lm, err := newLifecycleManager(st, pr)
+	if err != nil {
+		log.Fatalf("lifecycle init error: %v", err)
+	}
+
+	// WASM実行サンドボックスの制約（§8-4）
+	memPages := envInt("WASM_MEM_LIMIT_PAGES", 1024) // 64 KiB/page × 1024 = 64 MiB
+	if memPages < 1 || memPages > 65536 {
+		log.Fatalf("WASM_MEM_LIMIT_PAGES out of range (1-65536): %d", memPages)
+	}
+	sb := &sandbox{
+		execTimeout:   time.Duration(envInt("EXEC_TIMEOUT_SEC", 30)) * time.Second,
+		memLimitPages: uint32(memPages),
+	}
+
 	// サーバを goroutine で起動
-	// router がリクエストを振り分けるハンドラ
-	srv := &http.Server{Addr: addr, Handler: http.HandlerFunc(router)}
+	srv := &http.Server{Addr: addr, Handler: newHandler(lm, sb)}
 	go func() {
-		log.Printf("listening on http://%s", addr)
+		log.Printf("listening on http://%s (attestation: %s, data dir: %s)", addr, pr.attestationType, dataDir)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}
@@ -58,110 +77,14 @@ func getEnv(key, def string) string {
 	return def
 }
 
-func router(w http.ResponseWriter, r *http.Request) {
-	switch {
-	// ヘルスチェック --- GET /
-	case r.Method == http.MethodGet && r.URL.Path == "/":
-		okText(w, http.StatusOK, "OK: POST /execute-wasm (body = WASI Core Module)")
-	// メイン --- POST /execute-wasm
-	case r.Method == http.MethodPost && r.URL.Path == "/execute-wasm":
-		text, err := handleExecuteWasm(r)
-		if err != nil {
-			okText(w, http.StatusBadRequest, fmt.Sprintf("WASM error: %v", err))
-			return
-		}
-		okText(w, http.StatusOK, text)
-	default:
-		okText(w, http.StatusNotFound, "not found")
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-}
-
-func okText(w http.ResponseWriter, code int, s string) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(code)
-	_, _ = w.Write([]byte(s))
-}
-
-func handleExecuteWasm(r *http.Request) (string, error) {
-	// リクエストボディ（WASMバイナリ）の読み込み
-	body, err := io.ReadAll(r.Body)
+	n, err := strconv.Atoi(v)
 	if err != nil {
-		return "", err
+		log.Fatalf("invalid %s: %v", key, err)
 	}
-	defer r.Body.Close()
-
-	// wazeroランタイムの生成
-	ctx := context.Background()
-	runtime := wazero.NewRuntime(ctx)
-	defer runtime.Close(ctx)
-
-	// WASI（WebAssembly System Interface）のセットアップ
-	if _, err := wasi_snapshot_preview1.Instantiate(ctx, runtime); err != nil {
-		return "", err
-	}
-
-	// WASMバイナリをWASMモジュールとしてコンパイル
-	compiled, err := runtime.CompileModule(ctx, body)
-	if err != nil {
-		return "", err
-	}
-
-	// 出力バッファの用意
-	stdout := newCappedBuffer(outputCap)
-	stderr := newCappedBuffer(outputCap)
-	config := wazero.NewModuleConfig().
-		WithStdout(stdout).
-		WithStderr(stderr)
-
-	// モジュールの実行
-	mod, err := runtime.InstantiateModule(ctx, compiled, config)
-	if mod != nil {
-		defer mod.Close(ctx)
-	}
-
-	// 終了処理
-	if err != nil {
-		var exitErr *sys.ExitError
-		// WASIプログラムが正常終了する際，wazero上ではエラーとして返ってくるので，それを判定
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 0 {
-			// _start called proc_exit(0); not an error.
-		} else {
-			return "", err
-		}
-	}
-
-	// 結果の整形
-	out := stdout.String()
-	errOut := stderr.String()
-	if errOut == "" {
-		return out, nil
-	}
-	return fmt.Sprintf("-- stdout --\n%s\n\n-- stderr --\n%s", out, errOut), nil
-}
-
-// cappedBuffer stops accepting bytes once it reaches its capacity instead of
-// growing without bound, so a runaway module can't exhaust host memory.
-type cappedBuffer struct {
-	buf   bytes.Buffer
-	limit int
-}
-
-func newCappedBuffer(limit int) *cappedBuffer {
-	return &cappedBuffer{limit: limit}
-}
-
-func (c *cappedBuffer) Write(p []byte) (int, error) {
-	remaining := c.limit - c.buf.Len()
-	if remaining <= 0 {
-		return len(p), nil
-	}
-	if len(p) > remaining {
-		p = p[:remaining]
-	}
-	c.buf.Write(p)
-	return len(p), nil
-}
-
-func (c *cappedBuffer) String() string {
-	return c.buf.String()
+	return n
 }

@@ -6,11 +6,24 @@ loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}"
 # GoランタイムのP(論理プロセッサ)数を制限し、OSスレッド生成量を抑える
 # （sgx.max_threadsの余裕を確保するため）
 loader.env.GOMAXPROCS = "4"
+# 封印ストレージの場所（下記の encrypted mount を指す）
+loader.env.DATA_DIR = "/data_store"
 
 fs.mounts = [
   { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
   { path = "{{ arch_libdir }}", uri = "file:{{ arch_libdir }}" },
+  # 封印ストレージ（Gramine Protected Files / encrypted files）。
+  # エンクレーブ内からは平文に見えるが、ホスト側の data_store/ には
+  # 透過的に暗号化された状態でしか書き出されない
+  { path = "/data_store", uri = "file:data_store", type = "encrypted", key_name = "{{ '_sgx_mrsigner' if sgx else 'insecure_dev_key' }}" },
 ]
+
+{% if not sgx %}
+# gramine-direct（非SGX）にはSGXシーリング鍵が存在しないため、開発用の固定鍵で代用する。
+# この鍵に保護効果はない。本番はSGXで実行し、MRSIGNERから導出されるシーリング鍵
+# （_sgx_mrsigner: 署名者が同じなら、バイナリ更新後も同じデータを開ける）を使う
+fs.insecure__keys.insecure_dev_key = "00112233445566778899aabbccddeeff"
+{% endif %}
 
 sgx.debug = true
 sgx.edmm_enable = false
@@ -21,7 +34,9 @@ sgx.use_exinfo = false
 sgx.max_threads = 32
 sgx.isvprodid = 0
 sgx.isvsvn = 0
-sgx.remote_attestation = "none"
+# 削除証明にSGX quoteを含めるには "dcap"（要: ホスト側のDCAPスタック）。
+# "none" でも動作するが、証明は署名のみとなり第三者検証はできない
+sgx.remote_attestation = "{{ ra_type }}"
 sgx.enable_stats = false
 # Goランタイムはヒープのページ管理用に、実ヒープ使用量とは無関係に起動時から
 # 大きめの仮想アドレス空間を予約する。Rust版で足りていた256MではGoの初期化が

@@ -2,6 +2,8 @@
 *.manifest.sgx
 *.sig
 **/*.wasm
+!wasm_runner/testdata/*.wasm
 **/cache/*
+data_store/
 
 !.gitkeep
