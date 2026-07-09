@@ -55,7 +55,7 @@ func TestSandboxRejectsInvalidBinary(t *testing.T) {
 	}
 }
 
-// TestSandboxInputMount は登録データが /data/input として WASM から読めることを確認する（§8-2）。
+// TestSandboxInputMount は登録データが /data/input0 として WASM から読めることを確認する（§8-2）。
 // testdata/readinput.wasm は wasm_module/readinput/ を wasi-sdk でビルドしたもの
 func TestSandboxInputMount(t *testing.T) {
 	wasmBin, err := os.ReadFile("testdata/readinput.wasm")
@@ -63,7 +63,7 @@ func TestSandboxInputMount(t *testing.T) {
 		t.Skipf("testdata/readinput.wasm not found (build it with wasm_module/readinput): %v", err)
 	}
 	input := []byte("secret-input-42\n")
-	out, err := testSandbox().run(context.Background(), wasmBin, input)
+	out, err := testSandbox().run(context.Background(), wasmBin, [][]byte{input})
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -72,7 +72,24 @@ func TestSandboxInputMount(t *testing.T) {
 	}
 }
 
-// TestSandboxNoInputNoFS は input 無し（ステートレス実行）では /data/input が見えないことを確認する
+// TestSandboxMultiInputMount は複数データが指定順に /data/input0, /data/input1, ...
+// として見えることを確認する（readinput は input0 から順に連結して出力する）
+func TestSandboxMultiInputMount(t *testing.T) {
+	wasmBin, err := os.ReadFile("testdata/readinput.wasm")
+	if err != nil {
+		t.Skipf("testdata/readinput.wasm not found (build it with wasm_module/readinput): %v", err)
+	}
+	inputs := [][]byte{[]byte("first\n"), []byte("second\n"), []byte("third\n")}
+	out, err := testSandbox().run(context.Background(), wasmBin, inputs)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if want := "first\nsecond\nthird\n"; out != want {
+		t.Fatalf("out = %q, want %q", out, want)
+	}
+}
+
+// TestSandboxNoInputNoFS は input 無し（ステートレス実行）では /data/input0 が見えないことを確認する
 func TestSandboxNoInputNoFS(t *testing.T) {
 	wasmBin, err := os.ReadFile("testdata/readinput.wasm")
 	if err != nil {
@@ -81,7 +98,7 @@ func TestSandboxNoInputNoFS(t *testing.T) {
 	out, err := testSandbox().run(context.Background(), wasmBin, nil)
 	// readinput は open 失敗時に exit code 1 で終わるため、エラーまたは stderr 出力になる
 	if err == nil && !strings.Contains(out, "-- stderr --") {
-		t.Fatalf("reading /data/input without mount should fail, got out=%q", out)
+		t.Fatalf("reading /data/input0 without mount should fail, got out=%q", out)
 	}
 }
 

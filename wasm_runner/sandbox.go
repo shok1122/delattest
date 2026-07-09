@@ -21,8 +21,8 @@ const outputCap = 1 * 1024 * 1024
 // sandbox は WASM 実行サンドボックス（§6.3, §8）。
 //   - ネットワーク系ホスト関数は一切 instantiate しない。wasi_snapshot_preview1 の
 //     Core Module のみを提供し、WASI Socket 拡張等を将来も追加しないことが設計原則（§8-1）
-//   - ファイルシステムは input がある場合のみ /data/input を読み取り専用で見せる。
-//     書き込み用マウントは提供しない（§8-2）
+//   - ファイルシステムは inputs がある場合のみ /data/input0, /data/input1, ... を
+//     読み取り専用で見せる。書き込み用マウントは提供しない（§8-2）
 //   - 時計・乱数は wazero デフォルトの決定的な擬似値のまま。実時間・実乱数といった
 //     ホスト資源は与えない（§8-5 最小権限）
 type sandbox struct {
@@ -31,9 +31,9 @@ type sandbox struct {
 }
 
 // run は WASM バイナリを制約付きで実行し、stdout（stderr があれば併記）を返す。
-// input が非 nil の場合、その内容を読み取り専用ファイル /data/input として
+// inputs が非空の場合、i 番目の内容を読み取り専用ファイル /data/input<i> として
 // WASM 側に見せる。メモリ上の FS としてマウントするため平文がディスクに触れることはない
-func (s *sandbox) run(ctx context.Context, wasmBin, input []byte) (string, error) {
+func (s *sandbox) run(ctx context.Context, wasmBin []byte, inputs [][]byte) (string, error) {
 	// 実行タイムアウト（§8-4）。CloseOnContextDone により、無限ループ等で
 	// 実行中のコードも期限超過時に強制中断される
 	ctx, cancel := context.WithTimeout(ctx, s.execTimeout)
@@ -63,8 +63,11 @@ func (s *sandbox) run(ctx context.Context, wasmBin, input []byte) (string, error
 	config := wazero.NewModuleConfig().
 		WithStdout(stdout).
 		WithStderr(stderr)
-	if input != nil {
-		fsys := fstest.MapFS{"input": &fstest.MapFile{Data: input, Mode: 0o444}}
+	if len(inputs) > 0 {
+		fsys := fstest.MapFS{}
+		for i, input := range inputs {
+			fsys[fmt.Sprintf("input%d", i)] = &fstest.MapFile{Data: input, Mode: 0o444}
+		}
 		config = config.WithFSConfig(wazero.NewFSConfig().WithFSMount(fsys, "/data"))
 	}
 
