@@ -28,6 +28,13 @@ func main() {
 		log.Fatalf("storage init error: %v", err)
 	}
 
+	// ユーザ管理の初期化（§4.1）。永続化済みのユーザ表（owner_id ↔ APIキーハッシュ）を
+	// 読み込む
+	um, err := newUserManager(st)
+	if err != nil {
+		log.Fatalf("user manager init error: %v", err)
+	}
+
 	// 削除証明の発行モジュール（§6.4）。起動時に署名鍵を生成し、
 	// 公開鍵ハッシュを埋め込んだ quote を一度だけ取得する（§9.3）
 	pr := newProver()
@@ -50,7 +57,7 @@ func main() {
 	}
 
 	// サーバを goroutine で起動
-	srv := &http.Server{Addr: addr, Handler: newHandler(lm, sb)}
+	srv := &http.Server{Addr: addr, Handler: newHandler(lm, sb, um)}
 	go func() {
 		log.Printf("listening on http://%s (attestation: %s, data dir: %s)", addr, pr.attestationType, dataDir)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

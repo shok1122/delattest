@@ -3,7 +3,6 @@ package main
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,7 +28,7 @@ var (
 	errBusy       = errors.New("data is busy (IN_USE or DELETING)")
 	errDeleted    = errors.New("data already deleted")
 	errNotDeleted = errors.New("data is not deleted yet")
-	errForbidden  = errors.New("owner token mismatch")
+	errForbidden  = errors.New("data owner mismatch")
 )
 
 // metaRecord は §6.1 のメタデータストア1件分。封印ストレージに永続化される。
@@ -37,14 +36,14 @@ var (
 // DELETED のレコードは削除証明の再取得（§7 proof）と ID 再利用の禁止（§5 不変条件3）の
 // ために永続的に残す
 type metaRecord struct {
-	DataID         string          `json:"data_id"`
-	State          dataState       `json:"state"`
-	ContentHash    string          `json:"content_hash"` // "sha256:<hex>"（登録時点の元データのハッシュ）
-	CreatedAt      string          `json:"created_at"`   // RFC3339 UTC
-	OwnerTokenHash string          `json:"owner_token_hash,omitempty"`
-	DEK            []byte          `json:"dek,omitempty"`
-	DeletedAt      string          `json:"deleted_at,omitempty"`
-	Certificate    json.RawMessage `json:"certificate,omitempty"`
+	DataID      string          `json:"data_id"`
+	State       dataState       `json:"state"`
+	ContentHash string          `json:"content_hash"` // "sha256:<hex>"（登録時点の元データのハッシュ）
+	CreatedAt   string          `json:"created_at"`   // RFC3339 UTC
+	OwnerID     string          `json:"owner_id"`     // 登録者の owner_id（§4.1）。秘密ではない
+	DEK         []byte          `json:"dek,omitempty"`
+	DeletedAt   string          `json:"deleted_at,omitempty"`
+	Certificate json.RawMessage `json:"certificate,omitempty"`
 }
 
 // lifecycleManager は状態機械の唯一の管理者であり、状態を書き換えられる経路を
@@ -86,8 +85,13 @@ func newLifecycleManager(st *store, pr *prover) (*lifecycleManager, error) {
 	return lm, nil
 }
 
-// register はデータを封印保存し、REGISTERED 状態のレコードを作成する
-func (lm *lifecycleManager) register(data []byte, ownerToken string) (*metaRecord, error) {
+// register はデータを封印保存し、REGISTERED 状態のレコードを作成する。
+// 全データは認証済みユーザに帰属するため、ownerID は必須（ハンドラ側で認証済み）
+func (lm *lifecycleManager) register(data []byte, ownerID string) (*metaRecord, error) {
+	if ownerID == "" {
+		return nil, errors.New("owner id required")
+	}
+
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
@@ -107,11 +111,8 @@ func (lm *lifecycleManager) register(data []byte, ownerToken string) (*metaRecor
 		State:       stateRegistered,
 		ContentHash: "sha256:" + hex.EncodeToString(sum[:]),
 		CreatedAt:   nowRFC3339(),
+		OwnerID:     ownerID,
 		DEK:         dek,
-	}
-	if ownerToken != "" {
-		h := sha256.Sum256([]byte(ownerToken))
-		rec.OwnerTokenHash = hex.EncodeToString(h[:])
 	}
 
 	// blob → meta の順に書く。blob 書き込み後にクラッシュしても、meta の無い blob は
@@ -142,60 +143,74 @@ func (lm *lifecycleManager) newDataID() (string, error) {
 	return "", errors.New("could not allocate unique data id")
 }
 
-// checkToken は登録時のオーナートークンと照合する。トークン無しで登録されたデータは
-// 検証をスキップする（認可プロトコルの詳細設計は §11 の未解決課題）
-func checkToken(rec *metaRecord, token string) error {
-	if rec.OwnerTokenHash == "" {
-		return nil
-	}
-	h := sha256.Sum256([]byte(token))
-	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(h[:])), []byte(rec.OwnerTokenHash)) != 1 {
+// checkOwner は認証済みユーザ（ownerID）がレコードの所有者本人かを照合する（認可）。
+// owner_id は秘密ではない識別子であり、認証（API キーの検証）は userManager が済ませて
+// いるため、ここは単純な一致比較でよい
+func checkOwner(rec *metaRecord, ownerID string) error {
+	if rec.OwnerID != ownerID {
 		return errForbidden
 	}
 	return nil
 }
 
-// beginExecute は REGISTERED -> IN_USE に遷移させ、復号済みのデータ本体を返す。
-// 成功した場合、呼び出し側は実行完了後に必ず endExecute を呼ぶこと。
+// beginExecute は指定された全データを REGISTERED -> IN_USE に遷移させ、
+// 復号済みのデータ本体を指定順に返す（ids が空なら何もせず nil を返す）。
+// 取得は all-or-nothing: 1件でも検証・復号に失敗した場合、どのデータの状態も
+// 変更せずにエラーを返す（エラーには対象のデータIDが付与される）。
+// 成功した場合、呼び出し側は実行完了後に必ず同じ ids で endExecute を呼ぶこと。
 // IN_USE はメモリ上だけの一時状態として扱い永続化しない（クラッシュ時はディスク上の
 // REGISTERED のまま次回起動で復帰する）
-func (lm *lifecycleManager) beginExecute(id, token string) ([]byte, error) {
+func (lm *lifecycleManager) beginExecute(ids []string, ownerID string) ([][]byte, error) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
-	rec, ok := lm.entries[id]
-	if !ok {
-		return nil, errNotFound
-	}
-	if err := checkToken(rec, token); err != nil {
-		return nil, err
-	}
-	switch rec.State {
-	case stateDeleted:
-		return nil, errDeleted
-	case stateInUse, stateDeleting:
-		return nil, errBusy
+	// 全件を検証してから状態を変更する。mu が全遷移を直列化しているため、
+	// 検証と遷移の間に他のリクエストが割り込むことはない
+	recs := make([]*metaRecord, len(ids))
+	for i, id := range ids {
+		rec, ok := lm.entries[id]
+		if !ok {
+			return nil, fmt.Errorf("%s: %w", id, errNotFound)
+		}
+		if err := checkOwner(rec, ownerID); err != nil {
+			return nil, fmt.Errorf("%s: %w", id, err)
+		}
+		switch rec.State {
+		case stateDeleted:
+			return nil, fmt.Errorf("%s: %w", id, errDeleted)
+		case stateInUse, stateDeleting:
+			return nil, fmt.Errorf("%s: %w", id, errBusy)
+		}
+		recs[i] = rec
 	}
 
-	input, err := lm.store.readBlob(id, rec.DEK)
-	if err != nil {
-		return nil, fmt.Errorf("read sealed data: %w", err)
+	inputs := make([][]byte, len(ids))
+	for i, id := range ids {
+		input, err := lm.store.readBlob(id, recs[i].DEK)
+		if err != nil {
+			return nil, fmt.Errorf("read sealed data %s: %w", id, err)
+		}
+		inputs[i] = input
 	}
-	rec.State = stateInUse
-	return input, nil
+	for _, rec := range recs {
+		rec.State = stateInUse
+	}
+	return inputs, nil
 }
 
-// endExecute は IN_USE -> REGISTERED に戻す（execute complete, §5）
-func (lm *lifecycleManager) endExecute(id string) {
+// endExecute は指定された全データを IN_USE -> REGISTERED に戻す（execute complete, §5）
+func (lm *lifecycleManager) endExecute(ids []string) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
-	if rec, ok := lm.entries[id]; ok && rec.State == stateInUse {
-		rec.State = stateRegistered
+	for _, id := range ids {
+		if rec, ok := lm.entries[id]; ok && rec.State == stateInUse {
+			rec.State = stateRegistered
+		}
 	}
 }
 
 // delete はデータを削除し、削除証明を発行して返す（§9）
-func (lm *lifecycleManager) delete(id, token string) (json.RawMessage, error) {
+func (lm *lifecycleManager) delete(id, ownerID string) (json.RawMessage, error) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
@@ -203,7 +218,7 @@ func (lm *lifecycleManager) delete(id, token string) (json.RawMessage, error) {
 	if !ok {
 		return nil, errNotFound
 	}
-	if err := checkToken(rec, token); err != nil {
+	if err := checkOwner(rec, ownerID); err != nil {
 		return nil, err
 	}
 	switch rec.State {

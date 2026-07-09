@@ -35,6 +35,7 @@ func newStore(dir string) (*store, error) {
 
 func (s *store) metaPath(id string) string { return filepath.Join(s.baseDir, "meta", id+".json") }
 func (s *store) blobPath(id string) string { return filepath.Join(s.baseDir, "blobs", id+".bin") }
+func (s *store) usersPath() string         { return filepath.Join(s.baseDir, "users.json") }
 
 // atomicWrite は一時ファイルに書き切ってから rename する。
 // クラッシュしても書きかけのファイルが正規の名前で残らないようにするため
@@ -78,6 +79,32 @@ func (s *store) loadMetas() ([]*metaRecord, error) {
 			return nil, err
 		}
 		recs = append(recs, &rec)
+	}
+	return recs, nil
+}
+
+// writeUsers / loadUsers はユーザ表（§4.1 認証）を単一の JSON ファイルとして
+// 永続化する。DATA_DIR 以下に置くため、Gramine 実行時は meta/blobs と同様に
+// encrypted mount の保護下に入る
+func (s *store) writeUsers(recs []*userRecord) error {
+	b, err := json.Marshal(recs)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(s.usersPath(), b)
+}
+
+func (s *store) loadUsers() ([]*userRecord, error) {
+	b, err := os.ReadFile(s.usersPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var recs []*userRecord
+	if err := json.Unmarshal(b, &recs); err != nil {
+		return nil, err
 	}
 	return recs, nil
 }

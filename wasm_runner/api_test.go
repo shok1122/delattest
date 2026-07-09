@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -18,10 +19,31 @@ import (
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	lm := newTestManager(t, t.TempDir())
+	um, err := newUserManager(lm.store)
+	if err != nil {
+		t.Fatalf("newUserManager: %v", err)
+	}
 	sb := &sandbox{execTimeout: 10 * time.Second, memLimitPages: 1024}
-	srv := httptest.NewServer(newHandler(lm, sb))
+	srv := httptest.NewServer(newHandler(lm, sb, um))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// createTestUser は POST /users でユーザを発行し、owner_id と認証ヘッダを返す
+func createTestUser(t *testing.T, srvURL string) (string, map[string]string) {
+	t.Helper()
+	code, body := doReq(t, "POST", srvURL+"/users", nil, nil)
+	if code != http.StatusCreated {
+		t.Fatalf("create user: code=%d body=%s", code, body)
+	}
+	var u struct {
+		OwnerID string `json:"owner_id"`
+		APIKey  string `json:"api_key"`
+	}
+	if err := json.Unmarshal(body, &u); err != nil || u.OwnerID == "" || u.APIKey == "" {
+		t.Fatalf("create user response invalid: %s (err=%v)", body, err)
+	}
+	return u.OwnerID, map[string]string{"X-API-Key": u.APIKey}
 }
 
 func doReq(t *testing.T, method, url string, body []byte, headers map[string]string) (int, []byte) {
@@ -42,14 +64,15 @@ func doReq(t *testing.T, method, url string, body []byte, headers map[string]str
 	return resp.StatusCode, b
 }
 
-// TestAPILifecycleFlow は register -> status -> execute -> delete -> proof の
+// TestAPILifecycleFlow は user -> register -> status -> execute -> delete -> proof の
 // 一連の流れを HTTP 経由で検証する
 func TestAPILifecycleFlow(t *testing.T) {
 	srv := newTestServer(t)
+	_, auth := createTestUser(t, srv.URL)
 	data := []byte("lifecycle test data")
 
-	// 登録
-	code, body := doReq(t, "POST", srv.URL+"/data", data, nil)
+	// 登録（認証必須）
+	code, body := doReq(t, "POST", srv.URL+"/data", data, auth)
 	if code != http.StatusCreated {
 		t.Fatalf("register: code=%d body=%s", code, body)
 	}
@@ -61,20 +84,20 @@ func TestAPILifecycleFlow(t *testing.T) {
 		t.Fatalf("register response invalid: %s (err=%v)", body, err)
 	}
 
-	// 状態確認
+	// 状態確認（認証不要）
 	code, body = doReq(t, "GET", srv.URL+"/data/"+reg.DataID+"/status", nil, nil)
 	if code != http.StatusOK || !strings.Contains(string(body), `"REGISTERED"`) {
 		t.Fatalf("status: code=%d body=%s", code, body)
 	}
 
 	// 実行（no-op モジュール）
-	code, body = doReq(t, "POST", srv.URL+"/data/"+reg.DataID+"/execute", noopWasm(), nil)
+	code, body = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), auth)
 	if code != http.StatusOK {
 		t.Fatalf("execute: code=%d body=%s", code, body)
 	}
 
 	// 削除 → 削除証明が返る
-	code, certBody := doReq(t, "DELETE", srv.URL+"/data/"+reg.DataID, nil, nil)
+	code, certBody := doReq(t, "DELETE", srv.URL+"/data/"+reg.DataID, nil, auth)
 	if code != http.StatusOK {
 		t.Fatalf("delete: code=%d body=%s", code, certBody)
 	}
@@ -86,20 +109,20 @@ func TestAPILifecycleFlow(t *testing.T) {
 		t.Fatalf("status after delete: code=%d body=%s", code, body)
 	}
 
-	// 証明の再取得（監査用）は削除時のものと一致
+	// 証明の再取得（監査用、認証不要）は削除時のものと一致
 	code, proofBody := doReq(t, "GET", srv.URL+"/data/"+reg.DataID+"/proof", nil, nil)
 	if code != http.StatusOK || !bytes.Equal(proofBody, certBody) {
 		t.Fatalf("proof: code=%d body=%s", code, proofBody)
 	}
 
 	// DELETED への execute は 404（§5 不変条件3）
-	code, _ = doReq(t, "POST", srv.URL+"/data/"+reg.DataID+"/execute", noopWasm(), nil)
+	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), auth)
 	if code != http.StatusNotFound {
 		t.Fatalf("execute after delete: code=%d, want 404", code)
 	}
 
 	// 再削除は 409
-	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+reg.DataID, nil, nil)
+	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+reg.DataID, nil, auth)
 	if code != http.StatusConflict {
 		t.Fatalf("double delete: code=%d, want 409", code)
 	}
@@ -147,36 +170,54 @@ func verifyCertificate(t *testing.T, certBody []byte, dataID string, original []
 
 func TestAPIRegisterValidation(t *testing.T) {
 	srv := newTestServer(t)
+	_, auth := createTestUser(t, srv.URL)
 
 	// 空ボディは登録できない
-	code, _ := doReq(t, "POST", srv.URL+"/data", nil, nil)
+	code, _ := doReq(t, "POST", srv.URL+"/data", nil, auth)
 	if code != http.StatusBadRequest {
 		t.Fatalf("empty register: code=%d, want 400", code)
 	}
 
-	// 未知のIDへの操作は 404
-	for _, r := range [][2]string{
-		{"POST", "/data/d-ffffffffffffffff/execute"},
-		{"DELETE", "/data/d-ffffffffffffffff"},
-		{"GET", "/data/d-ffffffffffffffff/status"},
-		{"GET", "/data/d-ffffffffffffffff/proof"},
+	// 未知のIDへの操作は 404（execute/delete は認証を通した上で）
+	for _, r := range []struct {
+		method, path string
+		headers      map[string]string
+	}{
+		{"POST", "/execute?data=d-ffffffffffffffff", auth},
+		{"DELETE", "/data/d-ffffffffffffffff", auth},
+		{"GET", "/data/d-ffffffffffffffff/status", nil},
+		{"GET", "/data/d-ffffffffffffffff/proof", nil},
 	} {
 		body := []byte(nil)
-		if r[0] == "POST" {
+		if r.method == "POST" {
 			body = noopWasm()
 		}
-		code, _ := doReq(t, r[0], srv.URL+r[1], body, nil)
+		code, _ := doReq(t, r.method, srv.URL+r.path, body, r.headers)
 		if code != http.StatusNotFound {
-			t.Fatalf("%s %s: code=%d, want 404", r[0], r[1], code)
+			t.Fatalf("%s %s: code=%d, want 404", r.method, r.path, code)
 		}
 	}
 }
 
-func TestAPIOwnerToken(t *testing.T) {
+// TestAPIUserAuth はユーザ認証（401）と所有者照合（403）を確認する
+func TestAPIUserAuth(t *testing.T) {
 	srv := newTestServer(t)
-	headers := map[string]string{"X-Owner-Token": "s3cret"}
+	_, authA := createTestUser(t, srv.URL)
+	_, authB := createTestUser(t, srv.URL)
 
-	code, body := doReq(t, "POST", srv.URL+"/data", []byte("guarded"), headers)
+	// APIキー無し・無効なキーでは登録できない
+	code, _ := doReq(t, "POST", srv.URL+"/data", []byte("guarded"), nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("register without key: code=%d, want 401", code)
+	}
+	code, _ = doReq(t, "POST", srv.URL+"/data", []byte("guarded"),
+		map[string]string{"X-API-Key": "ak-bogus"})
+	if code != http.StatusUnauthorized {
+		t.Fatalf("register with invalid key: code=%d, want 401", code)
+	}
+
+	// ユーザAがデータを登録
+	code, body := doReq(t, "POST", srv.URL+"/data", []byte("guarded"), authA)
 	if code != http.StatusCreated {
 		t.Fatalf("register: code=%d body=%s", code, body)
 	}
@@ -185,40 +226,135 @@ func TestAPIOwnerToken(t *testing.T) {
 	}
 	_ = json.Unmarshal(body, &reg)
 
-	// トークン無し / 誤りは 403
-	code, _ = doReq(t, "POST", srv.URL+"/data/"+reg.DataID+"/execute", noopWasm(), nil)
-	if code != http.StatusForbidden {
-		t.Fatalf("execute without token: code=%d, want 403", code)
+	// キー無しの execute/delete は 401
+	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("execute without key: code=%d, want 401", code)
 	}
-	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+reg.DataID, nil, map[string]string{"X-Owner-Token": "wrong"})
+	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+reg.DataID, nil, nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("delete without key: code=%d, want 401", code)
+	}
+
+	// 他ユーザ（B）による execute/delete は 403
+	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), authB)
 	if code != http.StatusForbidden {
-		t.Fatalf("delete with wrong token: code=%d, want 403", code)
+		t.Fatalf("execute by other user: code=%d, want 403", code)
+	}
+	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+reg.DataID, nil, authB)
+	if code != http.StatusForbidden {
+		t.Fatalf("delete by other user: code=%d, want 403", code)
+	}
+
+	// 所有者の混在は不可: Bのデータを混ぜたAの実行は 403（all-or-nothing）
+	code, body = doReq(t, "POST", srv.URL+"/data", []byte("b's data"), authB)
+	if code != http.StatusCreated {
+		t.Fatalf("register by B: code=%d body=%s", code, body)
+	}
+	var regB struct {
+		DataID string `json:"data_id"`
+	}
+	_ = json.Unmarshal(body, &regB)
+	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID+"&data="+regB.DataID, noopWasm(), authA)
+	if code != http.StatusForbidden {
+		t.Fatalf("execute with mixed owners: code=%d, want 403", code)
+	}
+	code, body = doReq(t, "GET", srv.URL+"/data/"+reg.DataID+"/status", nil, nil)
+	if code != http.StatusOK || !strings.Contains(string(body), `"REGISTERED"`) {
+		t.Fatalf("status after failed mixed execute: code=%d body=%s", code, body)
 	}
 
 	// Authorization: Bearer でも渡せる
-	code, _ = doReq(t, "POST", srv.URL+"/data/"+reg.DataID+"/execute", noopWasm(),
-		map[string]string{"Authorization": "Bearer s3cret"})
+	bearer := map[string]string{"Authorization": "Bearer " + authA["X-API-Key"]}
+	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), bearer)
 	if code != http.StatusOK {
-		t.Fatalf("execute with bearer token: code=%d, want 200", code)
+		t.Fatalf("execute with bearer key: code=%d, want 200", code)
 	}
-	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+reg.DataID, nil, headers)
+
+	// 所有者本人は削除できる
+	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+reg.DataID, nil, authA)
 	if code != http.StatusOK {
-		t.Fatalf("delete with token: code=%d, want 200", code)
+		t.Fatalf("delete by owner: code=%d, want 200", code)
 	}
 }
 
+// TestAPIStatelessExecute はデータ指定ゼロ個（ステートレス実行、認証不要）を確認する
 func TestAPIStatelessExecute(t *testing.T) {
 	srv := newTestServer(t)
 
-	code, _ := doReq(t, "POST", srv.URL+"/execute-wasm", noopWasm(), nil)
+	code, _ := doReq(t, "POST", srv.URL+"/execute", noopWasm(), nil)
 	if code != http.StatusOK {
 		t.Fatalf("stateless execute: code=%d, want 200", code)
 	}
 
-	// 壊れたバイナリはエラーテキストを返す（既存挙動の維持）
-	code, body := doReq(t, "POST", srv.URL+"/execute-wasm", []byte("not wasm"), nil)
-	if code != http.StatusBadRequest || !strings.HasPrefix(string(body), "WASM error:") {
+	// 壊れたバイナリは JSON エラーを返す
+	code, body := doReq(t, "POST", srv.URL+"/execute", []byte("not wasm"), nil)
+	if code != http.StatusBadRequest || !strings.Contains(string(body), "WASM error:") {
 		t.Fatalf("stateless execute invalid: code=%d body=%s", code, body)
+	}
+}
+
+// TestAPIExecuteMultiData は複数データ指定の実行を確認する
+func TestAPIExecuteMultiData(t *testing.T) {
+	srv := newTestServer(t)
+	_, auth := createTestUser(t, srv.URL)
+
+	reg := func(data []byte) string {
+		code, body := doReq(t, "POST", srv.URL+"/data", data, auth)
+		if code != http.StatusCreated {
+			t.Fatalf("register: code=%d body=%s", code, body)
+		}
+		var r struct {
+			DataID string `json:"data_id"`
+		}
+		_ = json.Unmarshal(body, &r)
+		return r.DataID
+	}
+	idA := reg([]byte("alpha\n"))
+	idB := reg([]byte("beta\n"))
+
+	// 同一IDの重複指定は 400
+	code, _ := doReq(t, "POST", srv.URL+"/execute?data="+idA+"&data="+idA, noopWasm(), auth)
+	if code != http.StatusBadRequest {
+		t.Fatalf("duplicate ids: code=%d, want 400", code)
+	}
+
+	// 空のIDは 400
+	code, _ = doReq(t, "POST", srv.URL+"/execute?data=", noopWasm(), auth)
+	if code != http.StatusBadRequest {
+		t.Fatalf("empty id: code=%d, want 400", code)
+	}
+
+	// 存在しないIDが混ざると 404。既存データの状態は変わらない（all-or-nothing）
+	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+idA+"&data=d-ffffffffffffffff", noopWasm(), auth)
+	if code != http.StatusNotFound {
+		t.Fatalf("unknown id mixed: code=%d, want 404", code)
+	}
+	code, body := doReq(t, "GET", srv.URL+"/data/"+idA+"/status", nil, nil)
+	if code != http.StatusOK || !strings.Contains(string(body), `"REGISTERED"`) {
+		t.Fatalf("status after failed execute: code=%d body=%s", code, body)
+	}
+
+	// 2件指定の実行が成功し、実行後は両方とも REGISTERED に戻る
+	code, body = doReq(t, "POST", srv.URL+"/execute?data="+idA+"&data="+idB, noopWasm(), auth)
+	if code != http.StatusOK {
+		t.Fatalf("execute with 2 ids: code=%d body=%s", code, body)
+	}
+	for _, id := range []string{idA, idB} {
+		code, body = doReq(t, "GET", srv.URL+"/data/"+id+"/status", nil, nil)
+		if code != http.StatusOK || !strings.Contains(string(body), `"REGISTERED"`) {
+			t.Fatalf("status after execute: code=%d body=%s", code, body)
+		}
+	}
+
+	// readinput fixture があれば、指定順に /data/input0, input1 として見えることを内容で確認
+	wasmBin, err := os.ReadFile("testdata/readinput.wasm")
+	if err != nil {
+		t.Skipf("testdata/readinput.wasm not found: %v", err)
+	}
+	code, body = doReq(t, "POST", srv.URL+"/execute?data="+idB+"&data="+idA, wasmBin, auth)
+	if code != http.StatusOK || string(body) != "beta\nalpha\n" {
+		t.Fatalf("multi-input execute: code=%d body=%q, want %q", code, body, "beta\nalpha\n")
 	}
 }
 
@@ -233,22 +369,31 @@ func TestAPIHealth(t *testing.T) {
 // TestAPIExecuteBusyConflict は実行中のデータへの競合操作が 409 になることを確認する
 func TestAPIExecuteBusyConflict(t *testing.T) {
 	lm := newTestManager(t, t.TempDir())
+	um, err := newUserManager(lm.store)
+	if err != nil {
+		t.Fatalf("newUserManager: %v", err)
+	}
 	sb := &sandbox{execTimeout: 10 * time.Second, memLimitPages: 1024}
-	srv := httptest.NewServer(newHandler(lm, sb))
+	srv := httptest.NewServer(newHandler(lm, sb, um))
 	t.Cleanup(srv.Close)
 
-	rec, _ := lm.register([]byte("busy data"), "")
+	user, key, err := um.createUser()
+	if err != nil {
+		t.Fatalf("createUser: %v", err)
+	}
+	auth := map[string]string{"X-API-Key": key}
+	rec, _ := lm.register([]byte("busy data"), user.OwnerID)
 
 	// IN_USE 状態を直接作る（実行中の状態を模擬）
-	if _, err := lm.beginExecute(rec.DataID, ""); err != nil {
+	if _, err := lm.beginExecute([]string{rec.DataID}, user.OwnerID); err != nil {
 		t.Fatalf("beginExecute: %v", err)
 	}
 
-	code, _ := doReq(t, "POST", srv.URL+"/data/"+rec.DataID+"/execute", noopWasm(), nil)
+	code, _ := doReq(t, "POST", srv.URL+"/execute?data="+rec.DataID, noopWasm(), auth)
 	if code != http.StatusConflict {
 		t.Fatalf("execute while IN_USE: code=%d, want 409", code)
 	}
-	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+rec.DataID, nil, nil)
+	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+rec.DataID, nil, auth)
 	if code != http.StatusConflict {
 		t.Fatalf("delete while IN_USE: code=%d, want 409", code)
 	}
@@ -257,8 +402,8 @@ func TestAPIExecuteBusyConflict(t *testing.T) {
 		t.Fatalf("status while IN_USE: code=%d body=%s", code, body)
 	}
 
-	lm.endExecute(rec.DataID)
-	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+rec.DataID, nil, nil)
+	lm.endExecute([]string{rec.DataID})
+	code, _ = doReq(t, "DELETE", srv.URL+"/data/"+rec.DataID, nil, auth)
 	if code != http.StatusOK {
 		t.Fatalf("delete after execution finished: code=%d, want 200", code)
 	}
@@ -267,8 +412,9 @@ func TestAPIExecuteBusyConflict(t *testing.T) {
 // TestAPIBodyTooLarge はサイズ上限超過が 413 になることを確認する
 func TestAPIBodyTooLarge(t *testing.T) {
 	srv := newTestServer(t)
+	_, auth := createTestUser(t, srv.URL)
 	big := bytes.Repeat([]byte{0xaa}, maxDataBytes+1)
-	code, _ := doReq(t, "POST", srv.URL+"/data", big, nil)
+	code, _ := doReq(t, "POST", srv.URL+"/data", big, auth)
 	if code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized register: code=%d, want 413", code)
 	}

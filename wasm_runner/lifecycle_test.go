@@ -5,9 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 )
+
+// lifecycleManager 層のテストで使う owner_id。認証（APIキー → owner_id の解決）は
+// userManager 層の責務なので、この層では解決済みの owner_id を直接渡す
+const testOwner = "u-aaaaaaaaaaaaaaaa"
 
 func newTestManager(t *testing.T, dir string) *lifecycleManager {
 	t.Helper()
@@ -25,7 +30,7 @@ func newTestManager(t *testing.T, dir string) *lifecycleManager {
 func TestRegisterAndStatus(t *testing.T) {
 	lm := newTestManager(t, t.TempDir())
 
-	rec, err := lm.register([]byte("hello data"), "")
+	rec, err := lm.register([]byte("hello data"), testOwner)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -44,45 +49,119 @@ func TestRegisterAndStatus(t *testing.T) {
 	if _, err := lm.status("d-0000000000000000"); !errors.Is(err, errNotFound) {
 		t.Fatalf("status unknown id: err = %v, want errNotFound", err)
 	}
+
+	// owner_id 無しの登録は認められない（全データは認証済みユーザに帰属する）
+	if _, err := lm.register([]byte("orphan"), ""); err == nil {
+		t.Fatalf("register without owner should fail")
+	}
 }
 
 func TestExecuteLifecycle(t *testing.T) {
 	lm := newTestManager(t, t.TempDir())
 	data := []byte("secret-input")
-	rec, _ := lm.register(data, "")
+	rec, _ := lm.register(data, testOwner)
 
 	// REGISTERED -> IN_USE。復号済みデータが返る
-	input, err := lm.beginExecute(rec.DataID, "")
+	inputs, err := lm.beginExecute([]string{rec.DataID}, testOwner)
 	if err != nil {
 		t.Fatalf("beginExecute: %v", err)
 	}
-	if !bytes.Equal(input, data) {
-		t.Fatalf("input = %q, want %q", input, data)
+	if len(inputs) != 1 || !bytes.Equal(inputs[0], data) {
+		t.Fatalf("inputs = %q, want [%q]", inputs, data)
 	}
 
 	// IN_USE 中は execute/delete とも排他される（§5 不変条件2）
-	if _, err := lm.beginExecute(rec.DataID, ""); !errors.Is(err, errBusy) {
+	if _, err := lm.beginExecute([]string{rec.DataID}, testOwner); !errors.Is(err, errBusy) {
 		t.Fatalf("concurrent execute: err = %v, want errBusy", err)
 	}
-	if _, err := lm.delete(rec.DataID, ""); !errors.Is(err, errBusy) {
+	if _, err := lm.delete(rec.DataID, testOwner); !errors.Is(err, errBusy) {
 		t.Fatalf("delete while IN_USE: err = %v, want errBusy", err)
 	}
 
 	// execute complete -> REGISTERED に戻り、再び操作可能
-	lm.endExecute(rec.DataID)
+	lm.endExecute([]string{rec.DataID})
 	if info, _ := lm.status(rec.DataID); info.State != stateRegistered {
 		t.Fatalf("state after endExecute = %s, want REGISTERED", info.State)
 	}
-	if _, err := lm.delete(rec.DataID, ""); err != nil {
+	if _, err := lm.delete(rec.DataID, testOwner); err != nil {
 		t.Fatalf("delete after endExecute: %v", err)
+	}
+}
+
+// TestExecuteMultiData は複数データの一括実行を確認する:
+// 全件が指定順に返って同時に IN_USE になり、1件でも取得できない場合は
+// どのデータの状態も変わらない（all-or-nothing）
+func TestExecuteMultiData(t *testing.T) {
+	lm := newTestManager(t, t.TempDir())
+	a, _ := lm.register([]byte("data-a"), testOwner)
+	b, _ := lm.register([]byte("data-b"), testOwner)
+
+	// 指定順どおりに復号データが返り、全件が IN_USE になる
+	inputs, err := lm.beginExecute([]string{b.DataID, a.DataID}, testOwner)
+	if err != nil {
+		t.Fatalf("beginExecute: %v", err)
+	}
+	if len(inputs) != 2 || !bytes.Equal(inputs[0], []byte("data-b")) || !bytes.Equal(inputs[1], []byte("data-a")) {
+		t.Fatalf("inputs = %q, want [data-b data-a]", inputs)
+	}
+	for _, id := range []string{a.DataID, b.DataID} {
+		if info, _ := lm.status(id); info.State != stateInUse {
+			t.Fatalf("state of %s = %s, want IN_USE", id, info.State)
+		}
+	}
+	// 使用中のデータが1件でも重なる実行は拒否される（§5 不変条件2）
+	if _, err := lm.beginExecute([]string{a.DataID}, testOwner); !errors.Is(err, errBusy) {
+		t.Fatalf("overlapping execute: err = %v, want errBusy", err)
+	}
+	lm.endExecute([]string{b.DataID, a.DataID})
+	for _, id := range []string{a.DataID, b.DataID} {
+		if info, _ := lm.status(id); info.State != stateRegistered {
+			t.Fatalf("state of %s after endExecute = %s, want REGISTERED", id, info.State)
+		}
+	}
+
+	// all-or-nothing: 存在しないIDが混ざると、他のデータも IN_USE にならない
+	if _, err := lm.beginExecute([]string{a.DataID, "d-ffffffffffffffff"}, testOwner); !errors.Is(err, errNotFound) {
+		t.Fatalf("execute with unknown id: err = %v, want errNotFound", err)
+	}
+	if info, _ := lm.status(a.DataID); info.State != stateRegistered {
+		t.Fatalf("state after failed multi execute = %s, want REGISTERED", info.State)
+	}
+
+	// 他ユーザのデータが混ざる場合も同様（all-or-nothing、§4.1）
+	other, _ := lm.register([]byte("data-other"), "u-bbbbbbbbbbbbbbbb")
+	_, err = lm.beginExecute([]string{a.DataID, other.DataID}, testOwner)
+	if !errors.Is(err, errForbidden) || !strings.Contains(err.Error(), other.DataID) {
+		t.Fatalf("execute with other owner's id: err = %v, want errForbidden mentioning %s", err, other.DataID)
+	}
+	if info, _ := lm.status(a.DataID); info.State != stateRegistered {
+		t.Fatalf("state after failed multi execute = %s, want REGISTERED", info.State)
+	}
+
+	// 削除済みIDが混ざる場合も同様。エラーには対象のデータIDが含まれる
+	if _, err := lm.delete(b.DataID, testOwner); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	_, err = lm.beginExecute([]string{a.DataID, b.DataID}, testOwner)
+	if !errors.Is(err, errDeleted) || !strings.Contains(err.Error(), b.DataID) {
+		t.Fatalf("execute with deleted id: err = %v, want errDeleted mentioning %s", err, b.DataID)
+	}
+	if info, _ := lm.status(a.DataID); info.State != stateRegistered {
+		t.Fatalf("state after failed multi execute = %s, want REGISTERED", info.State)
+	}
+
+	// ゼロ個の指定は状態に触れず成功する（ステートレス実行に対応、認証も不要）
+	inputs, err = lm.beginExecute(nil, "")
+	if err != nil || len(inputs) != 0 {
+		t.Fatalf("empty execute: inputs=%v err=%v", inputs, err)
 	}
 }
 
 func TestDeleteIssuesCertificateAndBecomesTerminal(t *testing.T) {
 	lm := newTestManager(t, t.TempDir())
-	rec, _ := lm.register([]byte("to be deleted"), "")
+	rec, _ := lm.register([]byte("to be deleted"), testOwner)
 
-	cert, err := lm.delete(rec.DataID, "")
+	cert, err := lm.delete(rec.DataID, testOwner)
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -95,10 +174,10 @@ func TestDeleteIssuesCertificateAndBecomesTerminal(t *testing.T) {
 	}
 
 	// DELETED は終端状態（§5 不変条件3）: execute は不可、再削除も不可、proof は取得可
-	if _, err := lm.beginExecute(rec.DataID, ""); !errors.Is(err, errDeleted) {
+	if _, err := lm.beginExecute([]string{rec.DataID}, testOwner); !errors.Is(err, errDeleted) {
 		t.Fatalf("execute after delete: err = %v, want errDeleted", err)
 	}
-	if _, err := lm.delete(rec.DataID, ""); !errors.Is(err, errDeleted) {
+	if _, err := lm.delete(rec.DataID, testOwner); !errors.Is(err, errDeleted) {
 		t.Fatalf("double delete: err = %v, want errDeleted", err)
 	}
 	proof, err := lm.proof(rec.DataID)
@@ -110,28 +189,29 @@ func TestDeleteIssuesCertificateAndBecomesTerminal(t *testing.T) {
 	}
 
 	// 削除前のデータには proof は存在しない
-	rec2, _ := lm.register([]byte("alive"), "")
+	rec2, _ := lm.register([]byte("alive"), testOwner)
 	if _, err := lm.proof(rec2.DataID); !errors.Is(err, errNotDeleted) {
 		t.Fatalf("proof on alive data: err = %v, want errNotDeleted", err)
 	}
 }
 
-func TestOwnerTokenEnforcement(t *testing.T) {
+// TestOwnerEnforcement は所有者本人以外の execute/delete が拒否されることを確認する
+func TestOwnerEnforcement(t *testing.T) {
 	lm := newTestManager(t, t.TempDir())
-	rec, _ := lm.register([]byte("private"), "owner-secret")
+	rec, _ := lm.register([]byte("private"), testOwner)
 
-	if _, err := lm.beginExecute(rec.DataID, ""); !errors.Is(err, errForbidden) {
-		t.Fatalf("execute without token: err = %v, want errForbidden", err)
+	if _, err := lm.beginExecute([]string{rec.DataID}, ""); !errors.Is(err, errForbidden) {
+		t.Fatalf("execute without owner: err = %v, want errForbidden", err)
 	}
-	if _, err := lm.delete(rec.DataID, "wrong"); !errors.Is(err, errForbidden) {
-		t.Fatalf("delete with wrong token: err = %v, want errForbidden", err)
+	if _, err := lm.delete(rec.DataID, "u-bbbbbbbbbbbbbbbb"); !errors.Is(err, errForbidden) {
+		t.Fatalf("delete by other owner: err = %v, want errForbidden", err)
 	}
-	if _, err := lm.beginExecute(rec.DataID, "owner-secret"); err != nil {
-		t.Fatalf("execute with correct token: %v", err)
+	if _, err := lm.beginExecute([]string{rec.DataID}, testOwner); err != nil {
+		t.Fatalf("execute by owner: %v", err)
 	}
-	lm.endExecute(rec.DataID)
-	if _, err := lm.delete(rec.DataID, "owner-secret"); err != nil {
-		t.Fatalf("delete with correct token: %v", err)
+	lm.endExecute([]string{rec.DataID})
+	if _, err := lm.delete(rec.DataID, testOwner); err != nil {
+		t.Fatalf("delete by owner: %v", err)
 	}
 }
 
@@ -139,7 +219,7 @@ func TestOwnerTokenEnforcement(t *testing.T) {
 // ちょうど1回だけ成功し他は既削除エラーになることを確認する（TOCTOU対策 §5）
 func TestConcurrentDeleteRace(t *testing.T) {
 	lm := newTestManager(t, t.TempDir())
-	rec, _ := lm.register([]byte("contended"), "")
+	rec, _ := lm.register([]byte("contended"), testOwner)
 
 	const n = 16
 	var wg sync.WaitGroup
@@ -148,7 +228,7 @@ func TestConcurrentDeleteRace(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, results[i] = lm.delete(rec.DataID, "")
+			_, results[i] = lm.delete(rec.DataID, testOwner)
 		}()
 	}
 	wg.Wait()
@@ -176,9 +256,9 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
 
 	lm1 := newTestManager(t, dir)
-	alive, _ := lm1.register([]byte("survives restart"), "tok")
-	deleted, _ := lm1.register([]byte("deleted before restart"), "")
-	cert, err := lm1.delete(deleted.DataID, "")
+	alive, _ := lm1.register([]byte("survives restart"), testOwner)
+	deleted, _ := lm1.register([]byte("deleted before restart"), testOwner)
+	cert, err := lm1.delete(deleted.DataID, testOwner)
 	if err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -190,18 +270,18 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 	if err != nil || info.State != stateRegistered {
 		t.Fatalf("alive data after restart: info=%+v err=%v", info, err)
 	}
-	// オーナートークンも復元されている
-	if _, err := lm2.beginExecute(alive.DataID, "bad"); !errors.Is(err, errForbidden) {
-		t.Fatalf("token check after restart: err = %v, want errForbidden", err)
+	// 所有者情報も復元されている
+	if _, err := lm2.beginExecute([]string{alive.DataID}, "u-bbbbbbbbbbbbbbbb"); !errors.Is(err, errForbidden) {
+		t.Fatalf("owner check after restart: err = %v, want errForbidden", err)
 	}
-	input, err := lm2.beginExecute(alive.DataID, "tok")
+	inputs, err := lm2.beginExecute([]string{alive.DataID}, testOwner)
 	if err != nil {
 		t.Fatalf("execute after restart: %v", err)
 	}
-	if string(input) != "survives restart" {
-		t.Fatalf("input after restart = %q", input)
+	if len(inputs) != 1 || string(inputs[0]) != "survives restart" {
+		t.Fatalf("inputs after restart = %q", inputs)
 	}
-	lm2.endExecute(alive.DataID)
+	lm2.endExecute([]string{alive.DataID})
 
 	// 削除済みデータは DELETED のまま、証明も同一のものが再取得できる
 	proof, err := lm2.proof(deleted.DataID)
@@ -217,7 +297,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 func TestCryptoShreddingOnDisk(t *testing.T) {
 	dir := t.TempDir()
 	lm := newTestManager(t, dir)
-	rec, _ := lm.register([]byte("shred me"), "")
+	rec, _ := lm.register([]byte("shred me"), testOwner)
 
 	// 削除前: blob が存在し、meta に dek が含まれる
 	if _, err := os.Stat(lm.store.blobPath(rec.DataID)); err != nil {
@@ -228,7 +308,7 @@ func TestCryptoShreddingOnDisk(t *testing.T) {
 		t.Fatalf("meta before delete should contain dek: %s", metaRaw)
 	}
 
-	if _, err := lm.delete(rec.DataID, ""); err != nil {
+	if _, err := lm.delete(rec.DataID, testOwner); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
@@ -247,7 +327,7 @@ func TestCryptoShreddingOnDisk(t *testing.T) {
 func TestCrashDuringDeleteRecovery(t *testing.T) {
 	dir := t.TempDir()
 	lm := newTestManager(t, dir)
-	rec, _ := lm.register([]byte("crash victim"), "")
+	rec, _ := lm.register([]byte("crash victim"), testOwner)
 
 	// クラッシュを模擬: DELETING（DEK破棄済み）を永続化した直後の状態を作り、
 	// finishDelete を呼ばずに新しいマネージャを起動する
