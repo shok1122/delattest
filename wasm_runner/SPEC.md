@@ -61,6 +61,7 @@ listening on http://0.0.0.0:3000 (attestation: none, data dir: /data_store)
 |---|---|---|
 | `maxDataBytes` | 32 MiB | `handlers.go`。`POST /data` のボディ上限 |
 | `maxWasmBytes` | 32 MiB | `handlers.go`。WASM バイナリの上限 |
+| `maxArgsBytes` | 8 KiB | `handlers.go`。`POST /execute` の引数（`?arg=`）の合計上限 |
 | `outputCap` | 1 MiB | `sandbox.go`。stdout / stderr それぞれの上限（超過分は切り捨て） |
 
 リクエストボディは全量をメモリに読み込む（最大 32 MiB）。エンクレーブサイズ
@@ -117,6 +118,15 @@ listening on http://0.0.0.0:3000 (attestation: none, data dir: /data_store)
 - `data` 指定なし＝ステートレス実行（旧 `POST /execute-wasm` 相当）。ライフサイクル
   管理・削除証明の対象にならず、FS 自体をマウントしない。
 - 空のID・同一IDの重複指定は 400（`beginExecute` に渡る前にハンドラで拒否）。
+- クエリパラメータ `arg` の繰り返しで **WASI argv** を0個以上指定できる
+  （`POST /execute?data=<id>&arg=get&arg=github`）。指定順に `argv[1]` 以降として
+  渡り、`argv[0]` は固定値 `app.wasm`（`arg` 指定が1個も無ければ argv 自体を
+  提供しない）。`arg` は使い捨ての実行パラメータであり、ライフサイクル管理
+  （登録・削除証明）の対象にならない。空文字列の `arg` はそのまま argv として
+  渡す（`data` と違い 400 にしない）。合計 `maxArgsBytes` 超過は 413。
+  認証要件は `data` 側で決まる（`arg` のみの指定では認証不要）。
+  注意: クエリ文字列はプロキシ・アクセスログ等に残り得るため、秘密値
+  （パスワード等）を `arg` で渡す場合はログ経路に留意すること。
 - 指定した**全データ**が実行中 `IN_USE` になる。取得は all-or-nothing（§5.2）で、
   1件でも検証に失敗するとどのデータの状態も変更せず、エラーメッセージの先頭に
   対象のデータIDを付けて返す（例: `{"error":"d-...: data not found"}`）。
@@ -286,7 +296,7 @@ delete:
 | 出力上限（§8-3） | stdout/stderr 各 1 MiB（`cappedBuffer`）。DoS対策であり機密性目的ではない。上限到達後の書き込みは「成功」として扱い（モジュールを止めない）、超過分は捨てる。上限をまたぐ書き込みは受理できたバイト数を返す |
 | タイムアウト（§8-4） | `context.WithTimeout`（`EXEC_TIMEOUT_SEC`）+ `WithCloseOnContextDone(true)`。無限ループ等の実行中コードも強制中断され、`400 WASM error: execution aborted: context deadline exceeded (limit 30s)` を返す |
 | メモリ上限（§8-4） | `WithMemoryLimitPages`（既定 1024 ページ = 64 MiB）。超過を要求するモジュールはコンパイル/インスタンス化で拒否 |
-| 最小権限（§8-5） | 引数・環境変数は不提供。時計・乱数は wazero 既定の**決定的な擬似値**のまま（実時間・実乱数を与えない） |
+| 最小権限（§8-5） | 環境変数は不提供。引数（WASI argv）は `?arg=` で明示指定された場合のみ提供（§4.3）— リクエスト元が自ら渡す実行パラメータであり、時計・乱数のようなホスト資源ではないため最小権限には抵触しない。時計・乱数は wazero 既定の**決定的な擬似値**のまま（実時間・実乱数を与えない） |
 
 ### 7.2 実行フロー（`run`）
 
@@ -460,9 +470,11 @@ docker run --rm -v "$PWD":/work -w /work golang:1.25-bookworm go test ./... -cou
 | `TestAPIRegisterValidation` / `TestAPIExecuteBusyConflict` / `TestAPIBodyTooLarge` | ステータスコード対応表（§4.4）の確認 |
 | `TestAPIStatelessExecute` / `TestAPIHealth` | データ指定ゼロ個（ステートレス実行）とヘルスチェックの回帰 |
 | `TestAPIExecuteMultiData` | HTTP 経由の複数データ指定（重複 400・未知ID混在 404 と他データの状態不変・実行後の全件解放・`input0`/`input1` の内容と順序） |
+| `TestAPIExecuteArgs` | `?arg=` の WASI argv 受け渡し（ステートレス/データ併用・空 arg の許容・合計サイズ超過 413） |
 | `TestSandboxTimeout` | 無限ループが強制中断される（手組みのループWASM使用） |
 | `TestSandboxMemoryLimit` | 上限超過モジュール（2000ページ要求）の拒否 |
 | `TestSandboxInputMount` / `TestSandboxMultiInputMount` / `TestSandboxNoInputNoFS` | `/data/input0`, `/data/input1`, ... の可視性・順序（入力あり時のみ） |
+| `TestSandboxArgs` / `TestSandboxNoArgs` | WASI argv の受け渡し（`argv[0]="app.wasm"` + 指定順）と、指定なし時に argv を提供しないこと（手組みの argv エコー WASM 使用） |
 | `TestSandboxRunsNoopModule` / `TestSandboxRejectsInvalidBinary` / `TestCappedBuffer` | 基本動作・出力上限 |
 
 `wasm_test.go` はタイムアウト・メモリ上限テスト用の最小 WASM バイナリ

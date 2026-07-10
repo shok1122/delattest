@@ -358,6 +358,46 @@ func TestAPIExecuteMultiData(t *testing.T) {
 	}
 }
 
+// TestAPIExecuteArgs は ?arg= の繰り返しが WASI argv としてモジュールに渡り、
+// ライフサイクル管理（登録）を経ないことを確認する
+func TestAPIExecuteArgs(t *testing.T) {
+	srv := newTestServer(t)
+
+	// ステートレス実行 + args（認証不要）
+	code, body := doReq(t, "POST", srv.URL+"/execute?arg=get&arg=github", argsEchoWasm(), nil)
+	if code != http.StatusOK || string(body) != "app.wasm\x00get\x00github\x00" {
+		t.Fatalf("execute with args: code=%d body=%q", code, body)
+	}
+
+	// 空の arg も argv としてそのまま渡る（?data= と違い 400 にしない）
+	code, body = doReq(t, "POST", srv.URL+"/execute?arg=", argsEchoWasm(), nil)
+	if code != http.StatusOK || string(body) != "app.wasm\x00\x00" {
+		t.Fatalf("execute with empty arg: code=%d body=%q", code, body)
+	}
+
+	// data と args の併用（認証必須なのは data 側の要件）
+	_, auth := createTestUser(t, srv.URL)
+	code, body = doReq(t, "POST", srv.URL+"/data", []byte("vault"), auth)
+	if code != http.StatusCreated {
+		t.Fatalf("register: code=%d body=%s", code, body)
+	}
+	var reg struct {
+		DataID string `json:"data_id"`
+	}
+	_ = json.Unmarshal(body, &reg)
+	code, body = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID+"&arg=list", argsEchoWasm(), auth)
+	if code != http.StatusOK || string(body) != "app.wasm\x00list\x00" {
+		t.Fatalf("execute with data+args: code=%d body=%q", code, body)
+	}
+
+	// 合計サイズ超過は 413
+	big := strings.Repeat("a", maxArgsBytes+1)
+	code, _ = doReq(t, "POST", srv.URL+"/execute?arg="+big, argsEchoWasm(), nil)
+	if code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized args: code=%d, want 413", code)
+	}
+}
+
 func TestAPIHealth(t *testing.T) {
 	srv := newTestServer(t)
 	code, body := doReq(t, "GET", srv.URL+"/", nil, nil)

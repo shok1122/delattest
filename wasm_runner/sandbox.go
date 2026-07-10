@@ -32,8 +32,11 @@ type sandbox struct {
 
 // run は WASM バイナリを制約付きで実行し、stdout（stderr があれば併記）を返す。
 // inputs が非空の場合、i 番目の内容を読み取り専用ファイル /data/input<i> として
-// WASM 側に見せる。メモリ上の FS としてマウントするため平文がディスクに触れることはない
-func (s *sandbox) run(ctx context.Context, wasmBin []byte, inputs [][]byte) (string, error) {
+// WASM 側に見せる。メモリ上の FS としてマウントするため平文がディスクに触れることはない。
+// args が非空の場合、WASI argv として argv[0]="app.wasm" に続けて渡す。
+// argv はリクエスト元が明示指定した実行パラメータであり、時計・乱数のような
+// ホスト資源ではないため、§8-5（最小権限）には抵触しない
+func (s *sandbox) run(ctx context.Context, wasmBin []byte, inputs [][]byte, args []string) (string, error) {
 	// 実行タイムアウト（§8-4）。CloseOnContextDone により、無限ループ等で
 	// 実行中のコードも期限超過時に強制中断される
 	ctx, cancel := context.WithTimeout(ctx, s.execTimeout)
@@ -63,6 +66,9 @@ func (s *sandbox) run(ctx context.Context, wasmBin []byte, inputs [][]byte) (str
 	config := wazero.NewModuleConfig().
 		WithStdout(stdout).
 		WithStderr(stderr)
+	if len(args) > 0 {
+		config = config.WithArgs(append([]string{"app.wasm"}, args...)...)
+	}
 	if len(inputs) > 0 {
 		fsys := fstest.MapFS{}
 		for i, input := range inputs {

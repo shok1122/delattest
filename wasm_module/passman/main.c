@@ -1,9 +1,14 @@
 // パスワードマネージャ wasm モジュール
 //
-// 入力（POST /execute?data=<vault_id>&data=<cmd_id> の指定順にマウントされる）:
-//   /data/input0 : ボルト（1行1エントリ: name<TAB>username<TAB>password）
+// 入力:
+//   /data/input0 : ボルト（1行1エントリ: name<TAB>username<TAB>password）。
+//                  POST /execute?data=<vault_id> でマウントされる。
 //                  空行と '#' 始まりの行は無視する
-//   /data/input1 : コマンド（1行）。省略時（input1 が無い場合）は "list"
+//   コマンドは次の優先順で決まる:
+//     1. WASI argv（POST /execute?arg=get&arg=github のように指定。
+//        argv[1] 以降を空白1個で連結して1行のコマンドとして扱う）
+//     2. /data/input1（コマンド1行を登録済みデータとして2番目に指定）
+//     3. どちらも無ければ "list"
 //
 // コマンド:
 //   list                              エントリ名と username の一覧（パスワードは出力しない）
@@ -125,7 +130,28 @@ static void check_field(const char *label, const char *v) {
     }
 }
 
-int main(void) {
+/* argv[1] 以降を空白1個で連結して1行のコマンドにする。
+   連続する空白は保存されない点に注意（add のパスワードに影響し得る） */
+static char *join_args(int argc, char **argv) {
+    size_t total = 0;
+    for (int i = 1; i < argc; i++) {
+        total += strlen(argv[i]) + 1; /* 区切りの空白 or 終端 NUL の分 */
+    }
+    char *line = malloc(total);
+    if (!line) {
+        DIE("error: out of memory\n");
+    }
+    char *p = line;
+    for (int i = 1; i < argc; i++) {
+        size_t l = strlen(argv[i]);
+        memcpy(p, argv[i], l);
+        p += l;
+        *p++ = (i + 1 < argc) ? ' ' : '\0';
+    }
+    return line;
+}
+
+int main(int argc, char **argv) {
     size_t vault_len = 0;
     char *vault_text = read_all(VAULT_PATH, &vault_len);
     if (!vault_text) {
@@ -135,10 +161,15 @@ int main(void) {
     static entry entries[MAX_ENTRIES];
     size_t count = parse_vault(vault_text, entries);
 
-    /* コマンド（input1）: 無ければ list。最初の1行だけを見る */
-    size_t cmd_len = 0;
-    char *cmd_text = read_all(CMD_PATH, &cmd_len);
-    char *cmd_line = cmd_text ? cmd_text : "list";
+    /* コマンド: argv > /data/input1 > "list" の優先順。最初の1行だけを見る */
+    char *cmd_line;
+    if (argc >= 2) {
+        cmd_line = join_args(argc, argv);
+    } else {
+        size_t cmd_len = 0;
+        char *cmd_text = read_all(CMD_PATH, &cmd_len);
+        cmd_line = cmd_text ? cmd_text : "list";
+    }
     char *nl = strchr(cmd_line, '\n');
     if (nl) *nl = '\0';
 

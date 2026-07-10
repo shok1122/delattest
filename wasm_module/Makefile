@@ -16,12 +16,15 @@ all:
 build:
 	docker build -t wasi-build .
 
-# DATA にデータIDをスペース区切りで並べると ?data=<id>&data=... を組み立てる。
-# DATA を指定する場合は認証必須なので、KEY に APIキー（POST /users で発行）を渡す
-# 例: make test-local SRC=readinput DATA="d-xxxx d-yyyy" KEY=ak-...
+# DATA にデータIDをスペース区切りで並べると data=<id>&data=... を組み立てる。
+# DATA を指定する場合は認証必須なので、KEY に APIキー（POST /users で発行）を渡す。
+# ARGS に引数をスペース区切りで並べると arg=<v>&arg=... を組み立てる（WASI argv）。
+# URLエンコードはしないので、URLに使えない文字は呼び出し側でエンコードすること
+# 例: make test-local SRC=passman DATA=d-xxxx ARGS="get github" KEY=ak-...
 empty :=
 space := $(empty) $(empty)
-QUERY = $(if $(DATA),?$(subst $(space),&,$(strip $(foreach id,$(DATA),data=$(id)))))
+PARAMS = $(strip $(foreach id,$(DATA),data=$(id)) $(foreach a,$(ARGS),arg=$(a)))
+QUERY = $(if $(PARAMS),?$(subst $(space),&,$(PARAMS)))
 AUTH_HEADER = $(if $(KEY),-H "X-API-Key: $(KEY)")
 
 .PHONY: test

@@ -7,12 +7,20 @@
 
 ## 入力の規約
 
-`POST /execute?data=<vault_id>&data=<cmd_id>` の**指定順**にマウントされる。
+ボルトは登録済みデータとして `?data=<vault_id>`（1番目）で指定し、コマンドは
+**WASI argv**（`?arg=` の繰り返し）で渡すのが基本形。
 
-| パス | 内容 |
+```
+POST /execute?data=<vault_id>&arg=get&arg=github
+```
+
+| 入力 | 内容 |
 |---|---|
 | `/data/input0` | ボルト。1行1エントリの `name<TAB>username<TAB>password`。空行と `#` 始まりの行は無視 |
-| `/data/input1` | コマンド（1行）。省略時（data 指定がボルトのみ）は `list` |
+| argv（`?arg=` の繰り返し） | コマンド。`argv[1]` 以降を空白1個で連結して1行として解釈する |
+| `/data/input1`（任意） | コマンド（1行）。argv が無い場合のフォールバック（コマンドを登録済みデータとして渡す旧方式） |
+
+コマンドの優先順は argv > `/data/input1` > `list`（どちらも無い場合）。
 
 ## コマンド
 
@@ -70,26 +78,23 @@ curl -s -X POST "http://localhost:3000/execute?data=$VID" \
 #    bank    alice
 ```
 
-### 3. get（コマンドをデータとして登録して2番目に指定）
+### 3. get（コマンドは `?arg=` で渡す）
 
 ```sh
-printf 'get github\n' > cmd.txt
-CID=$(curl -s -X POST http://localhost:3000/data -H "X-API-Key: $KEY" --data-binary @cmd.txt \
-      | grep -o '"data_id":"[^"]*"' | cut -d'"' -f4)
-curl -s -X POST "http://localhost:3000/execute?data=$VID&data=$CID" \
+curl -s -X POST "http://localhost:3000/execute?data=$VID&arg=get&arg=github" \
   -H "X-API-Key: $KEY" -H "Content-Type: application/wasm" --data-binary @app.wasm
 # → gh-p@ss-1
 ```
 
+コマンドは使い捨ての実行パラメータなので、登録（`POST /data`）は不要。
+argv が使えない環境向けに、コマンド1行を登録して2番目のデータ
+（`&data=<cmd_id>` → `/data/input1`）として渡す旧方式も引き続き動く。
+
 ### 4. add — ボルトの更新（新規登録 + 旧ボルトの証明つき削除）
 
 ```sh
-printf 'add gitlab bob correct horse battery\n' > cmd.txt
-CID=$(curl -s -X POST http://localhost:3000/data -H "X-API-Key: $KEY" --data-binary @cmd.txt \
-      | grep -o '"data_id":"[^"]*"' | cut -d'"' -f4)
-
 # 新ボルト全体が stdout に返るのでファイルに受ける
-curl -s -X POST "http://localhost:3000/execute?data=$VID&data=$CID" \
+curl -s -X POST "http://localhost:3000/execute?data=$VID&arg=add&arg=gitlab&arg=bob&arg=correct&arg=horse&arg=battery" \
   -H "X-API-Key: $KEY" -H "Content-Type: application/wasm" --data-binary @app.wasm > vault2.txt
 
 # 新ボルトを登録し直す
@@ -113,17 +118,26 @@ curl -s -X POST "http://localhost:3000/execute?data=$VID2" \
 
 ```sh
 cd wasm_module
-make test-local SRC=passman DATA="$VID $CID" KEY=$KEY
+make test-local SRC=passman DATA=$VID ARGS="get github" KEY=$KEY
 ```
 
 ### エラー応答の例
 
 ```sh
-printf 'get nonexistent\n' > cmd.txt
-# （登録して実行すると）
+curl -s -X POST "http://localhost:3000/execute?data=$VID&arg=get&arg=nonexistent" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/wasm" --data-binary @app.wasm
 # -- stdout --
 #
 #
 # -- stderr --
 # error: no entry named nonexistent
 ```
+
+### `?arg=` の注意点
+
+- argv は空白1個で連結して解釈するため、連続空白を含むパスワードは argv 経由では
+  正しく渡せない（その場合は旧方式の `/data/input1` を使う）。URL に使えない文字は
+  URLエンコードして渡す。
+- クエリ文字列はプロキシやアクセスログに残り得る。`add` のようにパスワードが
+  コマンドに含まれる操作をログが残る経路越しに行う場合は、旧方式
+  （コマンドをデータとして登録して `/data/input1` で渡す）の方が安全。

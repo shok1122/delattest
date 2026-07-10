@@ -13,7 +13,7 @@ func testSandbox() *sandbox {
 }
 
 func TestSandboxRunsNoopModule(t *testing.T) {
-	out, err := testSandbox().run(context.Background(), noopWasm(), nil)
+	out, err := testSandbox().run(context.Background(), noopWasm(), nil, nil)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -26,7 +26,7 @@ func TestSandboxRunsNoopModule(t *testing.T) {
 func TestSandboxTimeout(t *testing.T) {
 	sb := &sandbox{execTimeout: 500 * time.Millisecond, memLimitPages: 1024}
 	start := time.Now()
-	_, err := sb.run(context.Background(), loopWasm(), nil)
+	_, err := sb.run(context.Background(), loopWasm(), nil, nil)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -43,14 +43,14 @@ func TestSandboxTimeout(t *testing.T) {
 // TestSandboxMemoryLimit はメモリ上限を超える要求を持つモジュールが拒否されることを確認する（§8-4）
 func TestSandboxMemoryLimit(t *testing.T) {
 	// bigMemWasm は 2000 ページ（125MiB）を要求するが、上限は 1024 ページ（64MiB）
-	_, err := testSandbox().run(context.Background(), bigMemWasm(), nil)
+	_, err := testSandbox().run(context.Background(), bigMemWasm(), nil, nil)
 	if err == nil {
 		t.Fatalf("module exceeding memory limit should fail")
 	}
 }
 
 func TestSandboxRejectsInvalidBinary(t *testing.T) {
-	if _, err := testSandbox().run(context.Background(), []byte("not wasm"), nil); err == nil {
+	if _, err := testSandbox().run(context.Background(), []byte("not wasm"), nil, nil); err == nil {
 		t.Fatalf("invalid binary should fail")
 	}
 }
@@ -63,7 +63,7 @@ func TestSandboxInputMount(t *testing.T) {
 		t.Skipf("testdata/readinput.wasm not found (build it with wasm_module/readinput): %v", err)
 	}
 	input := []byte("secret-input-42\n")
-	out, err := testSandbox().run(context.Background(), wasmBin, [][]byte{input})
+	out, err := testSandbox().run(context.Background(), wasmBin, [][]byte{input}, nil)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -80,12 +80,36 @@ func TestSandboxMultiInputMount(t *testing.T) {
 		t.Skipf("testdata/readinput.wasm not found (build it with wasm_module/readinput): %v", err)
 	}
 	inputs := [][]byte{[]byte("first\n"), []byte("second\n"), []byte("third\n")}
-	out, err := testSandbox().run(context.Background(), wasmBin, inputs)
+	out, err := testSandbox().run(context.Background(), wasmBin, inputs, nil)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if want := "first\nsecond\nthird\n"; out != want {
 		t.Fatalf("out = %q, want %q", out, want)
+	}
+}
+
+// TestSandboxArgs は ?arg= 由来の引数が WASI argv として argv[0]="app.wasm" に
+// 続けてモジュールに渡ることを確認する（argsEchoWasm は argv バッファ＝NUL 区切りの
+// 全引数をそのまま stdout に書く）
+func TestSandboxArgs(t *testing.T) {
+	out, err := testSandbox().run(context.Background(), argsEchoWasm(), nil, []string{"get", "github"})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if want := "app.wasm\x00get\x00github\x00"; out != want {
+		t.Fatalf("out = %q, want %q", out, want)
+	}
+}
+
+// TestSandboxNoArgs は args 指定なしでは argv が空（argv[0] すら無い）ことを確認する（§8-5）
+func TestSandboxNoArgs(t *testing.T) {
+	out, err := testSandbox().run(context.Background(), argsEchoWasm(), nil, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "" {
+		t.Fatalf("out = %q, want empty (no argv should be provided)", out)
 	}
 }
 
@@ -95,7 +119,7 @@ func TestSandboxNoInputNoFS(t *testing.T) {
 	if err != nil {
 		t.Skipf("testdata/readinput.wasm not found: %v", err)
 	}
-	out, err := testSandbox().run(context.Background(), wasmBin, nil)
+	out, err := testSandbox().run(context.Background(), wasmBin, nil, nil)
 	// readinput は open 失敗時に exit code 1 で終わるため、エラーまたは stderr 出力になる
 	if err == nil && !strings.Contains(out, "-- stderr --") {
 		t.Fatalf("reading /data/input0 without mount should fail, got out=%q", out)

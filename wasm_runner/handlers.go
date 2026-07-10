@@ -13,6 +13,7 @@ import (
 const (
 	maxDataBytes = 32 << 20 // 登録データの上限（リソース保護）
 	maxWasmBytes = 32 << 20 // WASMバイナリの上限（リソース保護）
+	maxArgsBytes = 8 << 10  // execute の引数（?arg=）の合計上限（リソース保護）
 )
 
 type server struct {
@@ -42,7 +43,7 @@ func newHandler(lm *lifecycleManager, sb *sandbox, um *userManager) http.Handler
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	okText(w, http.StatusOK, "OK: POST /users | POST /execute?data=<id>&data=... (wasm binary as body; zero or more data ids) | POST /data | DELETE /data/{id} | GET /data/{id}/status | GET /data/{id}/proof")
+	okText(w, http.StatusOK, "OK: POST /users | POST /execute?data=<id>&data=...&arg=<v>&arg=... (wasm binary as body; zero or more data ids / args) | POST /data | DELETE /data/{id} | GET /data/{id}/status | GET /data/{id}/proof")
 }
 
 // handleCreateUser はユーザ発行（POST /users）。owner_id と API キーを新規発行する。
@@ -92,10 +93,24 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 // handleExecute は WASM 実行（POST /execute）。ボディ＝WASMバイナリ。
 // クエリパラメータ data の繰り返しで登録済みデータを0個以上指定でき、指定順の
 // i 番目が読み取り専用ファイル /data/input<i> として WASM から見える。
+// クエリパラメータ arg の繰り返しで WASI argv を0個以上指定できる（指定順に
+// argv[1] 以降として渡る）。arg は使い捨ての実行パラメータであり、ライフサイクル
+// 管理（登録・削除証明）の対象にならない。
 // データを1個以上指定する場合は認証必須で、全データが認証済みユーザの所有で
 // なければならない。data 指定なしはステートレス実行（ライフサイクル管理・
 // 削除証明の対象外、認証不要）。応答＝実行結果（stdout、stderrがあれば併記）
 func (s *server) handleExecute(w http.ResponseWriter, r *http.Request) {
+	args := r.URL.Query()["arg"]
+	argsLen := 0
+	for _, a := range args {
+		argsLen += len(a)
+	}
+	if argsLen > maxArgsBytes {
+		writeJSONError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("args exceed %d bytes total", maxArgsBytes))
+		return
+	}
+
 	ids := r.URL.Query()["data"]
 	seen := make(map[string]bool, len(ids))
 	for _, id := range ids {
@@ -149,7 +164,7 @@ func (s *server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.lm.endExecute(ids)
 
-	out, err := s.sb.run(r.Context(), wasmBin, inputs)
+	out, err := s.sb.run(r.Context(), wasmBin, inputs, args)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("WASM error: %v", err))
 		return
