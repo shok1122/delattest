@@ -42,7 +42,7 @@ sgx.enable_stats = false
 # 大きめの仮想アドレス空間を予約する。Rust版で足りていた256MではGoの初期化が
 # "failed to reserve page summary memory" で失敗したため2Gまで拡大した
 # （sgx.enclave_sizeは2のべき乗である必要がある）
-sgx.enclave_size = "1G"
+sgx.enclave_size = "2G"
 
 sgx.trusted_files = [
   "file:{{ self_exe }}",
