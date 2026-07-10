@@ -1,6 +1,6 @@
 // 登録済みデータ（指定順に /data/input0, /data/input1, ... として
 // 読み取り専用でマウントされる）を順に連結して stdout に書き出すサンプル。
-// POST /execute?data=<id>&data=<id>... の動作確認用
+// POST /execute（JSON ボディの "data":["<id>",...]）の動作確認用
 #include <stdio.h>
 
 int main(void) {

@@ -13,7 +13,10 @@ import (
 const (
 	maxDataBytes = 32 << 20 // 登録データの上限（リソース保護）
 	maxWasmBytes = 32 << 20 // WASMバイナリの上限（リソース保護）
-	maxArgsBytes = 8 << 10  // execute の引数（?arg=）の合計上限（リソース保護）
+	maxArgsBytes = 8 << 10  // execute の引数（args）の合計上限（リソース保護）
+	// execute の JSON ボディ上限。base64 で約 4/3 倍に膨れた maxWasmBytes
+	// （約 42.7 MiB）+ args・データID等の余裕
+	maxExecBodyBytes = 44 << 20
 )
 
 type server struct {
@@ -32,7 +35,7 @@ func newHandler(lm *lifecycleManager, sb *sandbox, um *userManager) http.Handler
 	mux.HandleFunc("GET /{$}", s.handleHealth)
 	// ユーザ発行（owner_id + APIキー）
 	mux.HandleFunc("POST /users", s.handleCreateUser)
-	// WASM 実行（使用する登録済みデータを ?data=<id> の繰り返しで0個以上指定）
+	// WASM 実行（JSON ボディで WASM バイナリ・データID・引数を渡す）
 	mux.HandleFunc("POST /execute", s.handleExecute)
 	// ライフサイクル管理 API
 	mux.HandleFunc("POST /data", s.handleRegister)
@@ -43,7 +46,7 @@ func newHandler(lm *lifecycleManager, sb *sandbox, um *userManager) http.Handler
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	okText(w, http.StatusOK, "OK: POST /users | POST /execute?data=<id>&data=...&arg=<v>&arg=... (wasm binary as body; zero or more data ids / args) | POST /data | DELETE /data/{id} | GET /data/{id}/status | GET /data/{id}/proof")
+	okText(w, http.StatusOK, `OK: POST /users | POST /execute (JSON body: {"wasm":"<base64>","data":["<id>",...],"args":["<v>",...]}; data/args optional) | POST /data | DELETE /data/{id} | GET /data/{id}/status | GET /data/{id}/proof`)
 }
 
 // handleCreateUser はユーザ発行（POST /users）。owner_id と API キーを新規発行する。
@@ -90,19 +93,45 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleExecute は WASM 実行（POST /execute）。ボディ＝WASMバイナリ。
-// クエリパラメータ data の繰り返しで登録済みデータを0個以上指定でき、指定順の
-// i 番目が読み取り専用ファイル /data/input<i> として WASM から見える。
-// クエリパラメータ arg の繰り返しで WASI argv を0個以上指定できる（指定順に
-// argv[1] 以降として渡る）。arg は使い捨ての実行パラメータであり、ライフサイクル
-// 管理（登録・削除証明）の対象にならない。
+// executeRequest は POST /execute の JSON ボディ。
+// Wasm は []byte なので、JSON 上は base64 文字列としてエンコード/デコードされる
+type executeRequest struct {
+	Wasm []byte   `json:"wasm"` // WASM バイナリ（base64、必須）
+	Data []string `json:"data"` // 使用する登録済みデータのID（0個以上、省略可）
+	Args []string `json:"args"` // WASI argv（0個以上、省略可）
+}
+
+// handleExecute は WASM 実行（POST /execute）。ボディ＝JSON（executeRequest）。
+// data の指定順の i 番目が読み取り専用ファイル /data/input<i> として WASM から
+// 見える。args は WASI argv として指定順に argv[1] 以降として渡る。args は
+// 使い捨ての実行パラメータであり、ライフサイクル管理（登録・削除証明）の対象に
+// ならない。WASM バイナリ・引数ともボディで渡すため、URL（アクセスログ・
+// プロキシ等に残る）に実行内容が乗ることはない。
 // データを1個以上指定する場合は認証必須で、全データが認証済みユーザの所有で
 // なければならない。data 指定なしはステートレス実行（ライフサイクル管理・
 // 削除証明の対象外、認証不要）。応答＝実行結果（stdout、stderrがあれば併記）
 func (s *server) handleExecute(w http.ResponseWriter, r *http.Request) {
-	args := r.URL.Query()["arg"]
+	body, err := readBody(r, maxExecBodyBytes)
+	if err != nil {
+		writeJSONError(w, bodyErrStatus(err), fmt.Sprintf("read body: %v", err))
+		return
+	}
+	var req executeRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON body: %v", err))
+		return
+	}
+	if len(req.Wasm) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "empty wasm binary")
+		return
+	}
+	if len(req.Wasm) > maxWasmBytes {
+		writeJSONError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("wasm exceeds %d bytes", maxWasmBytes))
+		return
+	}
 	argsLen := 0
-	for _, a := range args {
+	for _, a := range req.Args {
 		argsLen += len(a)
 	}
 	if argsLen > maxArgsBytes {
@@ -111,7 +140,7 @@ func (s *server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ids := r.URL.Query()["data"]
+	ids := req.Data
 	seen := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		if id == "" {
@@ -127,21 +156,10 @@ func (s *server) handleExecute(w http.ResponseWriter, r *http.Request) {
 
 	var ownerID string
 	if len(ids) > 0 {
-		var err error
 		if ownerID, err = s.um.resolveOwner(apiKey(r)); err != nil {
 			writeJSONError(w, http.StatusUnauthorized, err.Error())
 			return
 		}
-	}
-
-	wasmBin, err := readBody(r, maxWasmBytes)
-	if err != nil {
-		writeJSONError(w, bodyErrStatus(err), fmt.Sprintf("read wasm: %v", err))
-		return
-	}
-	if len(wasmBin) == 0 {
-		writeJSONError(w, http.StatusBadRequest, "empty wasm binary")
-		return
 	}
 
 	// 指定された全データを原子的に IN_USE にする（全データの所有者が本人であることを照合）
@@ -164,7 +182,7 @@ func (s *server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.lm.endExecute(ids)
 
-	out, err := s.sb.run(r.Context(), wasmBin, inputs, args)
+	out, err := s.sb.run(r.Context(), req.Wasm, inputs, req.Args)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("WASM error: %v", err))
 		return

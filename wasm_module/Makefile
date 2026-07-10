@@ -16,28 +16,32 @@ all:
 build:
 	docker build -t wasi-build .
 
-# DATA にデータIDをスペース区切りで並べると data=<id>&data=... を組み立てる。
+# /execute は JSON ボディ {"wasm":"<base64>","data":[...],"args":[...]} を受け取る。
+# DATA にデータIDをスペース区切りで並べると "data":[...] を組み立てる。
 # DATA を指定する場合は認証必須なので、KEY に APIキー（POST /users で発行）を渡す。
-# ARGS に引数をスペース区切りで並べると arg=<v>&arg=... を組み立てる（WASI argv）。
-# URLエンコードはしないので、URLに使えない文字は呼び出し側でエンコードすること
+# ARGS に引数をスペース区切りで並べると "args":[...] を組み立てる（WASI argv。
+# 1ワード=1引数。引数に空白・二重引用符は使えない）
 # 例: make test-local SRC=passman DATA=d-xxxx ARGS="get github" KEY=ak-...
 empty :=
 space := $(empty) $(empty)
-PARAMS = $(strip $(foreach id,$(DATA),data=$(id)) $(foreach a,$(ARGS),arg=$(a)))
-QUERY = $(if $(PARAMS),?$(subst $(space),&,$(PARAMS)))
+comma := ,
+DATA_JSON = $(if $(DATA),$(comma)"data":[$(subst $(space),$(comma),$(strip $(foreach id,$(DATA),"$(id)")))])
+ARGS_JSON = $(if $(ARGS),$(comma)"args":[$(subst $(space),$(comma),$(strip $(foreach a,$(ARGS),"$(a)")))])
 AUTH_HEADER = $(if $(KEY),-H "X-API-Key: $(KEY)")
+
+define EXEC_CURL
+	{ printf '{"wasm":"'; base64 -w0 $(SRC)/app.wasm; printf '"%s}' '$(DATA_JSON)$(ARGS_JSON)'; } \
+		| curl -X POST "$(1)/execute" \
+			-H "Content-Type: application/json" \
+			$(AUTH_HEADER) \
+			--data-binary @-
+endef
 
 .PHONY: test
 test:
-	curl -X POST "http://delattest.dev:3000/execute$(QUERY)" \
-		-H "Content-Type: application/wasm" \
-		$(AUTH_HEADER) \
-		--data-binary @$(SRC)/app.wasm
+	$(call EXEC_CURL,http://delattest.dev:3000)
 
 .PHONY: test-local
 test-local:
-	curl -X POST "http://localhost:3000/execute$(QUERY)" \
-		-H "Content-Type: application/wasm" \
-		$(AUTH_HEADER) \
-		--data-binary @$(SRC)/app.wasm
+	$(call EXEC_CURL,http://localhost:3000)
 

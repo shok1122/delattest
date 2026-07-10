@@ -46,6 +46,16 @@ func createTestUser(t *testing.T, srvURL string) (string, map[string]string) {
 	return u.OwnerID, map[string]string{"X-API-Key": u.APIKey}
 }
 
+// execBody は POST /execute の JSON ボディを組み立てる（wasm は base64 化される）
+func execBody(t *testing.T, wasm []byte, ids, args []string) []byte {
+	t.Helper()
+	b, err := json.Marshal(executeRequest{Wasm: wasm, Data: ids, Args: args})
+	if err != nil {
+		t.Fatalf("marshal execute body: %v", err)
+	}
+	return b
+}
+
 func doReq(t *testing.T, method, url string, body []byte, headers map[string]string) (int, []byte) {
 	t.Helper()
 	req, err := http.NewRequest(method, url, bytes.NewReader(body))
@@ -91,7 +101,7 @@ func TestAPILifecycleFlow(t *testing.T) {
 	}
 
 	// 実行（no-op モジュール）
-	code, body = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), auth)
+	code, body = doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{reg.DataID}, nil), auth)
 	if code != http.StatusOK {
 		t.Fatalf("execute: code=%d body=%s", code, body)
 	}
@@ -116,7 +126,7 @@ func TestAPILifecycleFlow(t *testing.T) {
 	}
 
 	// DELETED への execute は 404（§5 不変条件3）
-	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), auth)
+	code, _ = doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{reg.DataID}, nil), auth)
 	if code != http.StatusNotFound {
 		t.Fatalf("execute after delete: code=%d, want 404", code)
 	}
@@ -183,14 +193,14 @@ func TestAPIRegisterValidation(t *testing.T) {
 		method, path string
 		headers      map[string]string
 	}{
-		{"POST", "/execute?data=d-ffffffffffffffff", auth},
+		{"POST", "/execute", auth},
 		{"DELETE", "/data/d-ffffffffffffffff", auth},
 		{"GET", "/data/d-ffffffffffffffff/status", nil},
 		{"GET", "/data/d-ffffffffffffffff/proof", nil},
 	} {
 		body := []byte(nil)
 		if r.method == "POST" {
-			body = noopWasm()
+			body = execBody(t, noopWasm(), []string{"d-ffffffffffffffff"}, nil)
 		}
 		code, _ := doReq(t, r.method, srv.URL+r.path, body, r.headers)
 		if code != http.StatusNotFound {
@@ -227,7 +237,7 @@ func TestAPIUserAuth(t *testing.T) {
 	_ = json.Unmarshal(body, &reg)
 
 	// キー無しの execute/delete は 401
-	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), nil)
+	code, _ = doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{reg.DataID}, nil), nil)
 	if code != http.StatusUnauthorized {
 		t.Fatalf("execute without key: code=%d, want 401", code)
 	}
@@ -237,7 +247,7 @@ func TestAPIUserAuth(t *testing.T) {
 	}
 
 	// 他ユーザ（B）による execute/delete は 403
-	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), authB)
+	code, _ = doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{reg.DataID}, nil), authB)
 	if code != http.StatusForbidden {
 		t.Fatalf("execute by other user: code=%d, want 403", code)
 	}
@@ -255,7 +265,7 @@ func TestAPIUserAuth(t *testing.T) {
 		DataID string `json:"data_id"`
 	}
 	_ = json.Unmarshal(body, &regB)
-	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID+"&data="+regB.DataID, noopWasm(), authA)
+	code, _ = doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{reg.DataID, regB.DataID}, nil), authA)
 	if code != http.StatusForbidden {
 		t.Fatalf("execute with mixed owners: code=%d, want 403", code)
 	}
@@ -266,7 +276,7 @@ func TestAPIUserAuth(t *testing.T) {
 
 	// Authorization: Bearer でも渡せる
 	bearer := map[string]string{"Authorization": "Bearer " + authA["X-API-Key"]}
-	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID, noopWasm(), bearer)
+	code, _ = doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{reg.DataID}, nil), bearer)
 	if code != http.StatusOK {
 		t.Fatalf("execute with bearer key: code=%d, want 200", code)
 	}
@@ -282,15 +292,40 @@ func TestAPIUserAuth(t *testing.T) {
 func TestAPIStatelessExecute(t *testing.T) {
 	srv := newTestServer(t)
 
-	code, _ := doReq(t, "POST", srv.URL+"/execute", noopWasm(), nil)
+	code, _ := doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), nil, nil), nil)
 	if code != http.StatusOK {
 		t.Fatalf("stateless execute: code=%d, want 200", code)
 	}
 
 	// 壊れたバイナリは JSON エラーを返す
-	code, body := doReq(t, "POST", srv.URL+"/execute", []byte("not wasm"), nil)
+	code, body := doReq(t, "POST", srv.URL+"/execute", execBody(t, []byte("not wasm"), nil, nil), nil)
 	if code != http.StatusBadRequest || !strings.Contains(string(body), "WASM error:") {
 		t.Fatalf("stateless execute invalid: code=%d body=%s", code, body)
+	}
+}
+
+// TestAPIExecuteBodyValidation は execute の JSON ボディの検証を確認する
+func TestAPIExecuteBodyValidation(t *testing.T) {
+	srv := newTestServer(t)
+
+	// JSON でないボディ（旧方式: 生の WASM バイナリ）は 400
+	code, body := doReq(t, "POST", srv.URL+"/execute", noopWasm(), nil)
+	if code != http.StatusBadRequest || !strings.Contains(string(body), "invalid JSON body") {
+		t.Fatalf("raw wasm body: code=%d body=%s, want 400 invalid JSON body", code, body)
+	}
+
+	// base64 として不正な wasm は 400
+	code, body = doReq(t, "POST", srv.URL+"/execute", []byte(`{"wasm":"???not-base64???"}`), nil)
+	if code != http.StatusBadRequest || !strings.Contains(string(body), "invalid JSON body") {
+		t.Fatalf("invalid base64: code=%d body=%s, want 400", code, body)
+	}
+
+	// wasm 無し・空は 400
+	for _, b := range []string{`{}`, `{"wasm":""}`, `{"args":["list"]}`} {
+		code, body = doReq(t, "POST", srv.URL+"/execute", []byte(b), nil)
+		if code != http.StatusBadRequest || !strings.Contains(string(body), "empty wasm binary") {
+			t.Fatalf("body %s: code=%d body=%s, want 400 empty wasm binary", b, code, body)
+		}
 	}
 }
 
@@ -314,19 +349,19 @@ func TestAPIExecuteMultiData(t *testing.T) {
 	idB := reg([]byte("beta\n"))
 
 	// 同一IDの重複指定は 400
-	code, _ := doReq(t, "POST", srv.URL+"/execute?data="+idA+"&data="+idA, noopWasm(), auth)
+	code, _ := doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{idA, idA}, nil), auth)
 	if code != http.StatusBadRequest {
 		t.Fatalf("duplicate ids: code=%d, want 400", code)
 	}
 
 	// 空のIDは 400
-	code, _ = doReq(t, "POST", srv.URL+"/execute?data=", noopWasm(), auth)
+	code, _ = doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{""}, nil), auth)
 	if code != http.StatusBadRequest {
 		t.Fatalf("empty id: code=%d, want 400", code)
 	}
 
 	// 存在しないIDが混ざると 404。既存データの状態は変わらない（all-or-nothing）
-	code, _ = doReq(t, "POST", srv.URL+"/execute?data="+idA+"&data=d-ffffffffffffffff", noopWasm(), auth)
+	code, _ = doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{idA, "d-ffffffffffffffff"}, nil), auth)
 	if code != http.StatusNotFound {
 		t.Fatalf("unknown id mixed: code=%d, want 404", code)
 	}
@@ -336,7 +371,7 @@ func TestAPIExecuteMultiData(t *testing.T) {
 	}
 
 	// 2件指定の実行が成功し、実行後は両方とも REGISTERED に戻る
-	code, body = doReq(t, "POST", srv.URL+"/execute?data="+idA+"&data="+idB, noopWasm(), auth)
+	code, body = doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{idA, idB}, nil), auth)
 	if code != http.StatusOK {
 		t.Fatalf("execute with 2 ids: code=%d body=%s", code, body)
 	}
@@ -352,25 +387,25 @@ func TestAPIExecuteMultiData(t *testing.T) {
 	if err != nil {
 		t.Skipf("testdata/readinput.wasm not found: %v", err)
 	}
-	code, body = doReq(t, "POST", srv.URL+"/execute?data="+idB+"&data="+idA, wasmBin, auth)
+	code, body = doReq(t, "POST", srv.URL+"/execute", execBody(t, wasmBin, []string{idB, idA}, nil), auth)
 	if code != http.StatusOK || string(body) != "beta\nalpha\n" {
 		t.Fatalf("multi-input execute: code=%d body=%q, want %q", code, body, "beta\nalpha\n")
 	}
 }
 
-// TestAPIExecuteArgs は ?arg= の繰り返しが WASI argv としてモジュールに渡り、
+// TestAPIExecuteArgs は JSON ボディの args が WASI argv としてモジュールに渡り、
 // ライフサイクル管理（登録）を経ないことを確認する
 func TestAPIExecuteArgs(t *testing.T) {
 	srv := newTestServer(t)
 
 	// ステートレス実行 + args（認証不要）
-	code, body := doReq(t, "POST", srv.URL+"/execute?arg=get&arg=github", argsEchoWasm(), nil)
+	code, body := doReq(t, "POST", srv.URL+"/execute", execBody(t, argsEchoWasm(), nil, []string{"get", "github"}), nil)
 	if code != http.StatusOK || string(body) != "app.wasm\x00get\x00github\x00" {
 		t.Fatalf("execute with args: code=%d body=%q", code, body)
 	}
 
-	// 空の arg も argv としてそのまま渡る（?data= と違い 400 にしない）
-	code, body = doReq(t, "POST", srv.URL+"/execute?arg=", argsEchoWasm(), nil)
+	// 空文字列の arg も argv としてそのまま渡る（data と違い 400 にしない）
+	code, body = doReq(t, "POST", srv.URL+"/execute", execBody(t, argsEchoWasm(), nil, []string{""}), nil)
 	if code != http.StatusOK || string(body) != "app.wasm\x00\x00" {
 		t.Fatalf("execute with empty arg: code=%d body=%q", code, body)
 	}
@@ -385,14 +420,14 @@ func TestAPIExecuteArgs(t *testing.T) {
 		DataID string `json:"data_id"`
 	}
 	_ = json.Unmarshal(body, &reg)
-	code, body = doReq(t, "POST", srv.URL+"/execute?data="+reg.DataID+"&arg=list", argsEchoWasm(), auth)
+	code, body = doReq(t, "POST", srv.URL+"/execute", execBody(t, argsEchoWasm(), []string{reg.DataID}, []string{"list"}), auth)
 	if code != http.StatusOK || string(body) != "app.wasm\x00list\x00" {
 		t.Fatalf("execute with data+args: code=%d body=%q", code, body)
 	}
 
 	// 合計サイズ超過は 413
 	big := strings.Repeat("a", maxArgsBytes+1)
-	code, _ = doReq(t, "POST", srv.URL+"/execute?arg="+big, argsEchoWasm(), nil)
+	code, _ = doReq(t, "POST", srv.URL+"/execute", execBody(t, argsEchoWasm(), nil, []string{big}), nil)
 	if code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized args: code=%d, want 413", code)
 	}
@@ -429,7 +464,7 @@ func TestAPIExecuteBusyConflict(t *testing.T) {
 		t.Fatalf("beginExecute: %v", err)
 	}
 
-	code, _ := doReq(t, "POST", srv.URL+"/execute?data="+rec.DataID, noopWasm(), auth)
+	code, _ := doReq(t, "POST", srv.URL+"/execute", execBody(t, noopWasm(), []string{rec.DataID}, nil), auth)
 	if code != http.StatusConflict {
 		t.Fatalf("execute while IN_USE: code=%d, want 409", code)
 	}

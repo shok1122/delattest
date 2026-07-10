@@ -1,13 +1,13 @@
 // パスワードマネージャ wasm モジュール
 //
-// 入力:
+// 入力（POST /execute の JSON ボディ {"wasm":..., "data":[...], "args":[...]} 経由）:
 //   /data/input0 : ボルト（1行1エントリ: name<TAB>username<TAB>password）。
-//                  POST /execute?data=<vault_id> でマウントされる。
+//                  "data" の1番目（ボルトの data_id）としてマウントされる。
 //                  空行と '#' 始まりの行は無視する
 //   コマンドは次の優先順で決まる:
-//     1. WASI argv（POST /execute?arg=get&arg=github のように指定。
+//     1. WASI argv（"args":["get","github"] のように指定。
 //        argv[1] 以降を空白1個で連結して1行のコマンドとして扱う）
-//     2. /data/input1（コマンド1行を登録済みデータとして2番目に指定）
+//     2. /data/input1（コマンド1行を登録済みデータとして "data" の2番目に指定）
 //     3. どちらも無ければ "list"
 //
 // コマンド:

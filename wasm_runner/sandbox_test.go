@@ -89,7 +89,7 @@ func TestSandboxMultiInputMount(t *testing.T) {
 	}
 }
 
-// TestSandboxArgs は ?arg= 由来の引数が WASI argv として argv[0]="app.wasm" に
+// TestSandboxArgs は JSON ボディの args 由来の引数が WASI argv として argv[0]="app.wasm" に
 // 続けてモジュールに渡ることを確認する（argsEchoWasm は argv バッファ＝NUL 区切りの
 // 全引数をそのまま stdout に書く）
 func TestSandboxArgs(t *testing.T) {

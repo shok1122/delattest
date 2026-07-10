@@ -144,7 +144,7 @@ make test SRC=hello1
 |---|---|
 | `GET /` | ヘルスチェック |
 | `POST /users` | ユーザ発行。応答: `{ owner_id, api_key, created_at }`。APIキーの平文はこの応答限り（サーバはハッシュのみ保存） |
-| `POST /execute` | WASM 実行。ボディ＝WASMバイナリ。クエリ `data`（繰り返し可）で使用する登録済みデータを **0個以上・可変長**で指定し、指定順の i 番目が `/data/input<i>` として WASM から見える。1個以上指定する場合は認証必須。`data` 指定なしはステートレス実行（ライフサイクル管理・削除証明の対象外、認証不要）。応答: 実行結果 |
+| `POST /execute` | WASM 実行。ボディ＝JSON `{"wasm":"<base64>","data":["<id>",...],"args":["<v>",...]}`（`data`/`args` は省略可）。`data` は使用する登録済みデータのID（**0個以上・可変長**）で、指定順の i 番目が `/data/input<i>` として WASM から見える。`args` は WASI argv（使い捨ての実行パラメータで、ライフサイクル管理の対象外）。`data` を1個以上指定する場合は認証必須。`data` 指定なしはステートレス実行（ライフサイクル管理・削除証明の対象外、認証不要）。応答: 実行結果 |
 | `POST /data` | データ登録（認証必須）。ボディ＝データ本体。応答: `{ data_id, registered_at }` |
 | `DELETE /data/{id}` | データ削除（認証必須、所有者本人のみ）。応答: 削除証明（JSON） |
 | `GET /data/{id}/status` | 現在の状態（`REGISTERED`/`IN_USE`/`DELETING`/`DELETED`）。生データは返さない |
@@ -175,19 +175,23 @@ curl -X POST http://localhost:3000/data \
   --data-binary "sensitive user data"
 # => {"data_id":"d-xxxxxxxxxxxxxxxx","registered_at":"..."}
 
-# 登録済みデータに対して WASM を実行（所有者本人のみ）。クエリ data で指定した
-# i 番目のデータが WASM から /data/input<i> として読み取り専用で見える
+# 登録済みデータに対して WASM を実行（所有者本人のみ）。JSON ボディの data で
+# 指定した i 番目のデータが WASM から /data/input<i> として読み取り専用で見える
 # （readinput は input0, input1, ... を順に連結して stdout に書き出すサンプル）
 make -C wasm_module/readinput all
-curl -X POST "http://localhost:3000/execute?data=d-xxxxxxxxxxxxxxxx" \
-  -H "X-API-Key: ak-..." \
-  --data-binary @wasm_module/readinput/app.wasm
+printf '{"wasm":"%s","data":["d-xxxxxxxxxxxxxxxx"]}' \
+    "$(base64 -w0 wasm_module/readinput/app.wasm)" \
+  | curl -X POST http://localhost:3000/execute \
+      -H "X-API-Key: ak-..." -H "Content-Type: application/json" \
+      --data-binary @-
 
-# 複数データを使う場合は data を繰り返す（全データが自分のものであること。
-# 0個ならステートレス実行で、認証不要）
-curl -X POST "http://localhost:3000/execute?data=d-xxxxxxxxxxxxxxxx&data=d-yyyyyyyyyyyyyyyy" \
-  -H "X-API-Key: ak-..." \
-  --data-binary @wasm_module/readinput/app.wasm
+# 複数データを使う場合は data の配列に並べる（全データが自分のものであること。
+# 0個ならステートレス実行で、認証不要）。args を付けると WASI argv として渡る
+printf '{"wasm":"%s","data":["d-xxxxxxxxxxxxxxxx","d-yyyyyyyyyyyyyyyy"],"args":["get","github"]}' \
+    "$(base64 -w0 wasm_module/readinput/app.wasm)" \
+  | curl -X POST http://localhost:3000/execute \
+      -H "X-API-Key: ak-..." -H "Content-Type: application/json" \
+      --data-binary @-
 
 # 削除（所有者本人のみ）→ 削除証明（JSON）が返る
 curl -X DELETE http://localhost:3000/data/d-xxxxxxxxxxxxxxxx \

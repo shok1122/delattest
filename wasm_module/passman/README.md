@@ -7,18 +7,18 @@
 
 ## 入力の規約
 
-ボルトは登録済みデータとして `?data=<vault_id>`（1番目）で指定し、コマンドは
-**WASI argv**（`?arg=` の繰り返し）で渡すのが基本形。
+`POST /execute` の JSON ボディで、ボルトの data_id を `data` の1番目に、
+コマンドを `args`（WASI argv）に指定するのが基本形。
 
-```
-POST /execute?data=<vault_id>&arg=get&arg=github
+```json
+{"wasm": "<base64 エンコードした app.wasm>", "data": ["<vault_id>"], "args": ["get", "github"]}
 ```
 
 | 入力 | 内容 |
 |---|---|
 | `/data/input0` | ボルト。1行1エントリの `name<TAB>username<TAB>password`。空行と `#` 始まりの行は無視 |
-| argv（`?arg=` の繰り返し） | コマンド。`argv[1]` 以降を空白1個で連結して1行として解釈する |
-| `/data/input1`（任意） | コマンド（1行）。argv が無い場合のフォールバック（コマンドを登録済みデータとして渡す旧方式） |
+| argv（`args` 配列） | コマンド。`argv[1]` 以降を空白1個で連結して1行として解釈する |
+| `/data/input1`（任意） | コマンド（1行）。argv が無い場合のフォールバック（コマンドを登録済みデータとして `data` の2番目に指定する旧方式） |
 
 コマンドの優先順は argv > `/data/input1` > `list`（どちらも無い場合）。
 
@@ -54,6 +54,19 @@ make SRC=passman    # passman/app.wasm を生成
 `cd wasm_runner && docker run --rm -v "$PWD":/work -w /work -p 3000:3000 golang:1.25-bookworm go run .`）。
 以下は `wasm_module/passman/` で実行する。
 
+実行リクエストは毎回同じ形（JSON ボディに base64 の WASM を入れる）なので、
+シェル関数を用意しておくと楽:
+
+```sh
+# 使い方: exec_wasm '["<data_id>", ...]' '["<arg>", ...]'（どちらも省略可）
+exec_wasm() {
+  printf '{"wasm":"%s","data":%s,"args":%s}' \
+      "$(base64 -w0 app.wasm)" "${1:-[]}" "${2:-[]}" \
+    | curl -s -X POST http://localhost:3000/execute \
+        -H "X-API-Key: $KEY" -H "Content-Type: application/json" --data-binary @-
+}
+```
+
 ### 1. ユーザ発行と初期ボルトの登録
 
 ```sh
@@ -72,30 +85,27 @@ VID=d-...    # 上の data_id
 ### 2. list（コマンド省略 = ボルトだけを指定）
 
 ```sh
-curl -s -X POST "http://localhost:3000/execute?data=$VID" \
-  -H "X-API-Key: $KEY" -H "Content-Type: application/wasm" --data-binary @app.wasm
+exec_wasm "[\"$VID\"]"
 # → github  alice
 #    bank    alice
 ```
 
-### 3. get（コマンドは `?arg=` で渡す）
+### 3. get（コマンドは `args` で渡す）
 
 ```sh
-curl -s -X POST "http://localhost:3000/execute?data=$VID&arg=get&arg=github" \
-  -H "X-API-Key: $KEY" -H "Content-Type: application/wasm" --data-binary @app.wasm
+exec_wasm "[\"$VID\"]" '["get","github"]'
 # → gh-p@ss-1
 ```
 
 コマンドは使い捨ての実行パラメータなので、登録（`POST /data`）は不要。
-argv が使えない環境向けに、コマンド1行を登録して2番目のデータ
-（`&data=<cmd_id>` → `/data/input1`）として渡す旧方式も引き続き動く。
+コマンド1行を登録して2番目のデータ（`data` の2番目 → `/data/input1`）として
+渡す旧方式も引き続き動く。
 
 ### 4. add — ボルトの更新（新規登録 + 旧ボルトの証明つき削除）
 
 ```sh
 # 新ボルト全体が stdout に返るのでファイルに受ける
-curl -s -X POST "http://localhost:3000/execute?data=$VID&arg=add&arg=gitlab&arg=bob&arg=correct&arg=horse&arg=battery" \
-  -H "X-API-Key: $KEY" -H "Content-Type: application/wasm" --data-binary @app.wasm > vault2.txt
+exec_wasm "[\"$VID\"]" '["add","gitlab","bob","correct","horse","battery"]' > vault2.txt
 
 # 新ボルトを登録し直す
 curl -s -X POST http://localhost:3000/data -H "X-API-Key: $KEY" --data-binary @vault2.txt
@@ -106,8 +116,7 @@ curl -s -X DELETE "http://localhost:3000/data/$VID" -H "X-API-Key: $KEY"
 # 証明は後からも取得できる: GET /data/$VID/proof
 
 # 以後は VID2 を使う。旧ボルトの実行は 404 になる
-curl -s -X POST "http://localhost:3000/execute?data=$VID2" \
-  -H "X-API-Key: $KEY" -H "Content-Type: application/wasm" --data-binary @app.wasm
+exec_wasm "[\"$VID2\"]"
 ```
 
 `del <name>` も同じ流れ（新ボルトを受けて登録し直し、旧ボルトを削除）。
@@ -124,8 +133,7 @@ make test-local SRC=passman DATA=$VID ARGS="get github" KEY=$KEY
 ### エラー応答の例
 
 ```sh
-curl -s -X POST "http://localhost:3000/execute?data=$VID&arg=get&arg=nonexistent" \
-  -H "X-API-Key: $KEY" -H "Content-Type: application/wasm" --data-binary @app.wasm
+exec_wasm "[\"$VID\"]" '["get","nonexistent"]'
 # -- stdout --
 #
 #
@@ -133,11 +141,8 @@ curl -s -X POST "http://localhost:3000/execute?data=$VID&arg=get&arg=nonexistent
 # error: no entry named nonexistent
 ```
 
-### `?arg=` の注意点
+### `args` の注意点
 
 - argv は空白1個で連結して解釈するため、連続空白を含むパスワードは argv 経由では
-  正しく渡せない（その場合は旧方式の `/data/input1` を使う）。URL に使えない文字は
-  URLエンコードして渡す。
-- クエリ文字列はプロキシやアクセスログに残り得る。`add` のようにパスワードが
-  コマンドに含まれる操作をログが残る経路越しに行う場合は、旧方式
-  （コマンドをデータとして登録して `/data/input1` で渡す）の方が安全。
+  正しく渡せない（その場合は旧方式の `/data/input1` を使う）。
+- JSON 文字列なので、パスワードに `"` や `\` を含める場合は JSON エスケープが必要。

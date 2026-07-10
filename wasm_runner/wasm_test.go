@@ -79,26 +79,26 @@ func argsEchoWasm() []byte {
 	b = append(b, exports...)
 	// code section
 	body := []byte{
-		0x00,                         // no locals
-		0x41, 0x00,                   // i32.const 0   (argc の書き込み先)
-		0x41, 0x04,                   // i32.const 4   (buf_size の書き込み先)
-		0x10, 0x00, 0x1a,             // call args_sizes_get; drop
-		0x41, 0x08,                   // i32.const 8    (argv ポインタ配列)
-		0x41, 0x80, 0x08,             // i32.const 1024 (argv バッファ)
-		0x10, 0x01, 0x1a,             // call args_get; drop
-		0x41, 0x80, 0x04,             // i32.const 512
-		0x41, 0x80, 0x08,             // i32.const 1024
-		0x36, 0x02, 0x00,             // i32.store      (iovec.base = 1024)
-		0x41, 0x84, 0x04,             // i32.const 516
-		0x41, 0x04,                   // i32.const 4
-		0x28, 0x02, 0x00,             // i32.load       (buf_size)
-		0x36, 0x02, 0x00,             // i32.store      (iovec.len = buf_size)
-		0x41, 0x01,                   // i32.const 1    (fd = stdout)
-		0x41, 0x80, 0x04,             // i32.const 512  (iovec)
-		0x41, 0x01,                   // i32.const 1    (iovec 数)
-		0x41, 0x88, 0x04,             // i32.const 520  (nwritten の書き込み先)
-		0x10, 0x02, 0x1a,             // call fd_write; drop
-		0x0b,                         // end
+		0x00,       // no locals
+		0x41, 0x00, // i32.const 0   (argc の書き込み先)
+		0x41, 0x04, // i32.const 4   (buf_size の書き込み先)
+		0x10, 0x00, 0x1a, // call args_sizes_get; drop
+		0x41, 0x08, // i32.const 8    (argv ポインタ配列)
+		0x41, 0x80, 0x08, // i32.const 1024 (argv バッファ)
+		0x10, 0x01, 0x1a, // call args_get; drop
+		0x41, 0x80, 0x04, // i32.const 512
+		0x41, 0x80, 0x08, // i32.const 1024
+		0x36, 0x02, 0x00, // i32.store      (iovec.base = 1024)
+		0x41, 0x84, 0x04, // i32.const 516
+		0x41, 0x04, // i32.const 4
+		0x28, 0x02, 0x00, // i32.load       (buf_size)
+		0x36, 0x02, 0x00, // i32.store      (iovec.len = buf_size)
+		0x41, 0x01, // i32.const 1    (fd = stdout)
+		0x41, 0x80, 0x04, // i32.const 512  (iovec)
+		0x41, 0x01, // i32.const 1    (iovec 数)
+		0x41, 0x88, 0x04, // i32.const 520  (nwritten の書き込み先)
+		0x10, 0x02, 0x1a, // call fd_write; drop
+		0x0b, // end
 	}
 	b = append(b, 0x0a, byte(len(body)+2), 0x01, byte(len(body)))
 	return append(b, body...)
