@@ -6,5 +6,7 @@
 **/cache/*
 data_store/
 wasm_runner/wasm-runner
+*.pem
+*.bin
 
 !.gitkeep
