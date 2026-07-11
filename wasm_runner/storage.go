@@ -19,13 +19,18 @@ import (
 //     削除時に DEK を破棄することで、暗号化 blob やそのバックアップが残存しても
 //     復号不能にする（クリプトシュレッディング §9.1）
 //
-// 配置: baseDir/meta/<id>.json（メタデータ）, baseDir/blobs/<id>.bin（暗号化データ本体）
+// 配置: baseDir/meta/<id>.json（データメタデータ）, baseDir/blobs/<id>.bin（暗号化データ本体）,
+// baseDir/programs/<id>.{json,bin}（プログラムレジストリ）, baseDir/owner.json（オーナー鍵）
 type store struct {
 	baseDir string
 }
 
 func newStore(dir string) (*store, error) {
-	for _, d := range []string{filepath.Join(dir, "meta"), filepath.Join(dir, "blobs")} {
+	for _, d := range []string{
+		filepath.Join(dir, "meta"),
+		filepath.Join(dir, "blobs"),
+		filepath.Join(dir, "programs"),
+	} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, err
 		}
@@ -35,7 +40,13 @@ func newStore(dir string) (*store, error) {
 
 func (s *store) metaPath(id string) string { return filepath.Join(s.baseDir, "meta", id+".json") }
 func (s *store) blobPath(id string) string { return filepath.Join(s.baseDir, "blobs", id+".bin") }
-func (s *store) usersPath() string         { return filepath.Join(s.baseDir, "users.json") }
+func (s *store) ownerPath() string         { return filepath.Join(s.baseDir, "owner.json") }
+func (s *store) programMetaPath(id string) string {
+	return filepath.Join(s.baseDir, "programs", id+".json")
+}
+func (s *store) programBlobPath(id string) string {
+	return filepath.Join(s.baseDir, "programs", id+".bin")
+}
 
 // atomicWrite は一時ファイルに書き切ってから rename する。
 // クラッシュしても書きかけのファイルが正規の名前で残らないようにするため
@@ -83,30 +94,88 @@ func (s *store) loadMetas() ([]*metaRecord, error) {
 	return recs, nil
 }
 
-// writeUsers / loadUsers はユーザ表（§4.1 認証）を単一の JSON ファイルとして
-// 永続化する。DATA_DIR 以下に置くため、Gramine 実行時は meta/blobs と同様に
-// encrypted mount の保護下に入る
-func (s *store) writeUsers(recs []*userRecord) error {
-	b, err := json.Marshal(recs)
+// writeOwner / loadOwner はオーナー鍵（TOFU 登録、§3.1 案B）を単一の JSON ファイル
+// として永続化する。DATA_DIR 以下に置くため、Gramine 実行時は meta/blobs と同様に
+// encrypted mount の保護下に入る（＝登録済み状態をホストが巻き戻せない前提はデータと同等）
+func (s *store) writeOwner(rec *ownerRecord) error {
+	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
-	return atomicWrite(s.usersPath(), b)
+	return atomicWrite(s.ownerPath(), b)
 }
 
-func (s *store) loadUsers() ([]*userRecord, error) {
-	b, err := os.ReadFile(s.usersPath())
+func (s *store) loadOwner() (*ownerRecord, error) {
+	b, err := os.ReadFile(s.ownerPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	var recs []*userRecord
-	if err := json.Unmarshal(b, &recs); err != nil {
+	var rec ownerRecord
+	if err := json.Unmarshal(b, &rec); err != nil {
 		return nil, err
 	}
+	return &rec, nil
+}
+
+// プログラムレジストリの永続化。プログラムは削除証明・クリプトシュレッディングの
+// 対象ではないため、データ本体と違い DEK による二重暗号化はせず、encrypted mount の
+// 保護（層1）にのみ依存する。完全性はロード時のコンテンツハッシュ照合で検証する
+func (s *store) writeProgramMeta(rec *programRecord) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(s.programMetaPath(rec.ProgramID), b)
+}
+
+func (s *store) loadProgramMetas() ([]*programRecord, error) {
+	entries, err := os.ReadDir(filepath.Join(s.baseDir, "programs"))
+	if err != nil {
+		return nil, err
+	}
+	var recs []*programRecord
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(s.baseDir, "programs", e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		var rec programRecord
+		if err := json.Unmarshal(b, &rec); err != nil {
+			return nil, err
+		}
+		recs = append(recs, &rec)
+	}
 	return recs, nil
+}
+
+func (s *store) writeProgramBlob(id string, wasm []byte) error {
+	return atomicWrite(s.programBlobPath(id), wasm)
+}
+
+func (s *store) readProgramBlob(id string) ([]byte, error) {
+	return os.ReadFile(s.programBlobPath(id))
+}
+
+func (s *store) removeProgramMeta(id string) error {
+	err := os.Remove(s.programMetaPath(id))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (s *store) removeProgramBlob(id string) error {
+	err := os.Remove(s.programBlobPath(id))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func (s *store) writeBlob(id string, dek, plaintext []byte) error {

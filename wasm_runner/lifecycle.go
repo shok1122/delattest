@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"time"
 )
@@ -24,11 +25,12 @@ const (
 
 // ライフサイクル操作のエラー種別。HTTPステータスへの対応付けは handlers 側で行う
 var (
-	errNotFound   = errors.New("data not found")
-	errBusy       = errors.New("data is busy (IN_USE or DELETING)")
-	errDeleted    = errors.New("data already deleted")
-	errNotDeleted = errors.New("data is not deleted yet")
-	errForbidden  = errors.New("data owner mismatch")
+	errNotFound          = errors.New("data not found")
+	errBusy              = errors.New("data is busy (IN_USE or DELETING)")
+	errDeleted           = errors.New("data already deleted")
+	errNotDeleted        = errors.New("data is not deleted yet")
+	errForbidden         = errors.New("requester key is not authorized for this data")
+	errProgramNotAllowed = errors.New("program is not in the allowed_programs of this data")
 )
 
 // metaRecord は §6.1 のメタデータストア1件分。封印ストレージに永続化される。
@@ -36,14 +38,20 @@ var (
 // DELETED のレコードは削除証明の再取得（§7 proof）と ID 再利用の禁止（§5 不変条件3）の
 // ために永続的に残す
 type metaRecord struct {
-	DataID      string          `json:"data_id"`
-	State       dataState       `json:"state"`
-	ContentHash string          `json:"content_hash"` // "sha256:<hex>"（登録時点の元データのハッシュ）
-	CreatedAt   string          `json:"created_at"`   // RFC3339 UTC
-	OwnerID     string          `json:"owner_id"`     // 登録者の owner_id（§4.1）。秘密ではない
-	DEK         []byte          `json:"dek,omitempty"`
-	DeletedAt   string          `json:"deleted_at,omitempty"`
-	Certificate json.RawMessage `json:"certificate,omitempty"`
+	DataID      string    `json:"data_id"`
+	State       dataState `json:"state"`
+	ContentHash string    `json:"content_hash"` // "sha256:<hex>"（登録時点の元データのハッシュ）
+	CreatedAt   string    `json:"created_at"`   // RFC3339 UTC
+	// Uploader はアップローダの公開鍵（Ed25519 raw 32B の base64）。
+	// 「誰がアップロードしたか」の識別（U3）に加え、ホワイトリスト編集・削除の
+	// 認可主体の特定（U5、§3.4）に使う。削除証明には含めない（§7-Q6）
+	Uploader string `json:"uploader"`
+	// AllowedPrograms はこのデータに対して実行を許可する program_id の集合（U5）。
+	// 空＝すべて拒否（deny by default、§7-Q8）。状態機械の状態ではなく可変メタデータ
+	AllowedPrograms []string        `json:"allowed_programs"`
+	DEK             []byte          `json:"dek,omitempty"`
+	DeletedAt       string          `json:"deleted_at,omitempty"`
+	Certificate     json.RawMessage `json:"certificate,omitempty"`
 }
 
 // lifecycleManager は状態機械の唯一の管理者であり、状態を書き換えられる経路を
@@ -86,10 +94,14 @@ func newLifecycleManager(st *store, pr *prover) (*lifecycleManager, error) {
 }
 
 // register はデータを封印保存し、REGISTERED 状態のレコードを作成する。
-// 全データは認証済みユーザに帰属するため、ownerID は必須（ハンドラ側で認証済み）
-func (lm *lifecycleManager) register(data []byte, ownerID string) (*metaRecord, error) {
-	if ownerID == "" {
-		return nil, errors.New("owner id required")
+// uploader（署名検証済みのアップローダ公開鍵）は必須。allowedPrograms は
+// 省略（nil）可能で、その場合は空リスト＝すべて拒否（deny by default）になる
+func (lm *lifecycleManager) register(data []byte, uploader string, allowedPrograms []string) (*metaRecord, error) {
+	if uploader == "" {
+		return nil, errors.New("uploader key required")
+	}
+	if allowedPrograms == nil {
+		allowedPrograms = []string{}
 	}
 
 	lm.mu.Lock()
@@ -107,12 +119,13 @@ func (lm *lifecycleManager) register(data []byte, ownerID string) (*metaRecord, 
 
 	sum := sha256.Sum256(data)
 	rec := &metaRecord{
-		DataID:      id,
-		State:       stateRegistered,
-		ContentHash: "sha256:" + hex.EncodeToString(sum[:]),
-		CreatedAt:   nowRFC3339(),
-		OwnerID:     ownerID,
-		DEK:         dek,
+		DataID:          id,
+		State:           stateRegistered,
+		ContentHash:     "sha256:" + hex.EncodeToString(sum[:]),
+		CreatedAt:       nowRFC3339(),
+		Uploader:        uploader,
+		AllowedPrograms: allowedPrograms,
+		DEK:             dek,
 	}
 
 	// blob → meta の順に書く。blob 書き込み後にクラッシュしても、meta の無い blob は
@@ -143,24 +156,18 @@ func (lm *lifecycleManager) newDataID() (string, error) {
 	return "", errors.New("could not allocate unique data id")
 }
 
-// checkOwner は認証済みユーザ（ownerID）がレコードの所有者本人かを照合する（認可）。
-// owner_id は秘密ではない識別子であり、認証（API キーの検証）は userManager が済ませて
-// いるため、ここは単純な一致比較でよい
-func checkOwner(rec *metaRecord, ownerID string) error {
-	if rec.OwnerID != ownerID {
-		return errForbidden
-	}
-	return nil
-}
-
 // beginExecute は指定された全データを REGISTERED -> IN_USE に遷移させ、
 // 復号済みのデータ本体を指定順に返す（ids が空なら何もせず nil を返す）。
+// 「誰が実行できるか」（オーナー署名）はハンドラ側で検証済みで、ここでは
+// 「どのプログラムで実行できるか」＝データごとのホワイトリスト照合（U5、§3.4）を行う。
+// 照合は execute 開始時点のスナップショットで、実行途中のホワイトリスト編集は
+// 当該実行に影響しない。
 // 取得は all-or-nothing: 1件でも検証・復号に失敗した場合、どのデータの状態も
 // 変更せずにエラーを返す（エラーには対象のデータIDが付与される）。
 // 成功した場合、呼び出し側は実行完了後に必ず同じ ids で endExecute を呼ぶこと。
 // IN_USE はメモリ上だけの一時状態として扱い永続化しない（クラッシュ時はディスク上の
 // REGISTERED のまま次回起動で復帰する）
-func (lm *lifecycleManager) beginExecute(ids []string, ownerID string) ([][]byte, error) {
+func (lm *lifecycleManager) beginExecute(ids []string, programID string) ([][]byte, error) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
@@ -172,8 +179,8 @@ func (lm *lifecycleManager) beginExecute(ids []string, ownerID string) ([][]byte
 		if !ok {
 			return nil, fmt.Errorf("%s: %w", id, errNotFound)
 		}
-		if err := checkOwner(rec, ownerID); err != nil {
-			return nil, fmt.Errorf("%s: %w", id, err)
+		if !slices.Contains(rec.AllowedPrograms, programID) {
+			return nil, fmt.Errorf("%s: %w", id, errProgramNotAllowed)
 		}
 		switch rec.State {
 		case stateDeleted:
@@ -209,8 +216,16 @@ func (lm *lifecycleManager) endExecute(ids []string) {
 	}
 }
 
-// delete はデータを削除し、削除証明を発行して返す（§9）
-func (lm *lifecycleManager) delete(id, ownerID string) (json.RawMessage, error) {
+// setAllowedPrograms はホワイトリストを全置換する（差分 API は設けない。冪等で単純、§3.4）。
+// 編集できるのは当該データに記録済みのアップローダ鍵の署名者のみ（オーナー鍵では不可。
+// オーナーが自分に都合よく許可を広げることを防ぐのが U5 の目的のため）。
+// 編集は削除系状態（DELETING/DELETED）に入るまで可能で、IN_USE 中も認める
+// （実行中の編集はこのロックで直列化され、実行への適用は次回 execute から）
+func (lm *lifecycleManager) setAllowedPrograms(id, requester string, programs []string) (*metaRecord, error) {
+	if programs == nil {
+		programs = []string{}
+	}
+
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
@@ -218,8 +233,44 @@ func (lm *lifecycleManager) delete(id, ownerID string) (json.RawMessage, error) 
 	if !ok {
 		return nil, errNotFound
 	}
-	if err := checkOwner(rec, ownerID); err != nil {
-		return nil, err
+	if requester != rec.Uploader {
+		return nil, errForbidden
+	}
+	switch rec.State {
+	case stateDeleted:
+		return nil, errDeleted
+	case stateDeleting:
+		return nil, errBusy
+	}
+
+	old := rec.AllowedPrograms
+	rec.AllowedPrograms = programs
+	// IN_USE はメモリ上だけの一時状態で永続化しない、という不変条件を保つため、
+	// 実行中の編集はディスク上では REGISTERED として書き出す
+	persist := *rec
+	if persist.State == stateInUse {
+		persist.State = stateRegistered
+	}
+	if err := lm.store.writeMeta(&persist); err != nil {
+		rec.AllowedPrograms = old
+		return nil, fmt.Errorf("persist allowed_programs: %w", err)
+	}
+	return rec, nil
+}
+
+// delete はデータを削除し、削除証明を発行して返す（§9）。
+// 削除できるのはランナーオーナー（isOwner はハンドラがオーナー鍵との一致で判定済み）
+// または当該データに記録済みのアップローダ鍵の署名者（§7-Q3: 両方可）
+func (lm *lifecycleManager) delete(id, requester string, isOwner bool) (json.RawMessage, error) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	rec, ok := lm.entries[id]
+	if !ok {
+		return nil, errNotFound
+	}
+	if !isOwner && requester != rec.Uploader {
+		return nil, errForbidden
 	}
 	switch rec.State {
 	case stateDeleted:

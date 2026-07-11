@@ -16,32 +16,28 @@ all:
 build:
 	docker build -t wasi-build .
 
-# /execute は JSON ボディ {"wasm":"<base64>","data":[...],"args":[...]} を受け取る。
-# DATA にデータIDをスペース区切りで並べると "data":[...] を組み立てる。
-# DATA を指定する場合は認証必須なので、KEY に APIキー（POST /users で発行）を渡す。
-# ARGS に引数をスペース区切りで並べると "args":[...] を組み立てる（WASI argv。
-# 1ワード=1引数。引数に空白・二重引用符は使えない）
-# 例: make test-local SRC=passman DATA=d-xxxx ARGS="get github" KEY=ak-...
-empty :=
-space := $(empty) $(empty)
-comma := ,
-DATA_JSON = $(if $(DATA),$(comma)"data":[$(subst $(space),$(comma),$(strip $(foreach id,$(DATA),"$(id)")))])
-ARGS_JSON = $(if $(ARGS),$(comma)"args":[$(subst $(space),$(comma),$(strip $(foreach a,$(ARGS),"$(a)")))])
-AUTH_HEADER = $(if $(KEY),-H "X-API-Key: $(KEY)")
+# /execute は事前アップロード済みプログラムを program_id（p-<sha256>）で参照する。
+# すべてのコマンドは Ed25519 署名認証が必須なので、KEY にオーナー秘密鍵
+# （scripts/runner-cli.sh keygen で生成した PEM）を渡す。
+# アップロードは冪等（同一バイナリ→同一ID）なので毎回実行してよい。
+# DATA にデータIDをスペース区切りで並べると -d の繰り返しに展開される
+# （各データのホワイトリストに当該 program_id が入っていること）。
+# ARGS も同様に -a に展開される（WASI argv。1ワード=1引数。空白・二重引用符は不可）。
+# 例: make test-local SRC=passman KEY=../owner.pem DATA=d-xxxx ARGS="get github"
+CLI := ../scripts/runner-cli.sh
 
-define EXEC_CURL
-	{ printf '{"wasm":"'; base64 -w0 $(SRC)/app.wasm; printf '"%s}' '$(DATA_JSON)$(ARGS_JSON)'; } \
-		| curl -X POST "$(1)/execute" \
-			-H "Content-Type: application/json" \
-			$(AUTH_HEADER) \
-			--data-binary @-
+define EXEC_CLI
+	@test -n "$(KEY)" || { echo "KEY=<owner key .pem> is required (generate: $(CLI) keygen owner.pem)" >&2; exit 1; }
+	$(CLI) -u $(1) -k $(KEY) program-upload $(SRC)/app.wasm
+	$(CLI) -u $(1) -k $(KEY) execute $$($(CLI) program-id $(SRC)/app.wasm) \
+		$(foreach id,$(DATA),-d $(id)) $(foreach a,$(ARGS),-a $(a))
 endef
 
 .PHONY: test
 test:
-	$(call EXEC_CURL,http://delattest.dev:3000)
+	$(call EXEC_CLI,http://delattest.dev:3000)
 
 .PHONY: test-local
 test-local:
-	$(call EXEC_CURL,http://localhost:3000)
+	$(call EXEC_CLI,http://localhost:3000)
 

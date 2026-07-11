@@ -28,11 +28,30 @@ func main() {
 		log.Fatalf("storage init error: %v", err)
 	}
 
-	// ユーザ管理の初期化（§4.1）。永続化済みのユーザ表（owner_id ↔ APIキーハッシュ）を
-	// 読み込む
-	um, err := newUserManager(st)
+	// オーナー鍵管理の初期化（TOFU）。登録済みならロードし、未登録なら
+	// POST /owner での初回登録を待つ（登録までコマンドはすべて拒否される）
+	om, err := newOwnerManager(st)
 	if err != nil {
-		log.Fatalf("user manager init error: %v", err)
+		log.Fatalf("owner manager init error: %v", err)
+	}
+	if k, ok := om.key(); ok {
+		log.Printf("owner key registered: %s", k)
+	} else {
+		log.Printf("owner key not registered yet: register via POST /owner (commands are rejected until then)")
+	}
+
+	// 署名認証（Ed25519）。リプレイ対策のタイムスタンプ許容ウィンドウは
+	// AUTH_WINDOW_SEC（秒）で調整できる
+	windowSec := envInt("AUTH_WINDOW_SEC", 300)
+	if windowSec < 1 {
+		log.Fatalf("AUTH_WINDOW_SEC must be positive: %d", windowSec)
+	}
+	auth := newAuthenticator(time.Duration(windowSec) * time.Second)
+
+	// プログラムレジストリの初期化（§3.2）。永続化済みメタデータを読み込む
+	preg, err := newProgramRegistry(st)
+	if err != nil {
+		log.Fatalf("program registry init error: %v", err)
 	}
 
 	// 削除証明の発行モジュール（§6.4）。起動時に署名鍵を生成し、
@@ -57,7 +76,7 @@ func main() {
 	}
 
 	// サーバを goroutine で起動
-	srv := &http.Server{Addr: addr, Handler: newHandler(lm, sb, um)}
+	srv := &http.Server{Addr: addr, Handler: newHandler(lm, sb, preg, om, auth)}
 	go func() {
 		log.Printf("listening on http://%s (attestation: %s, data dir: %s)", addr, pr.attestationType, dataDir)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
