@@ -263,11 +263,16 @@ rm -rf data_store/blobs data_store/meta data_store/users.json
 
 # 3. 生成済みマニフェストの削除（モードを選び直して再生成できるように）
 make clean
+
+# 4. バイナリの再ビルド（wasm_runner/ のソースを更新した場合は必須）
+#    cache/wasm-runner は自動では作り直されないため、ソースだけ更新して
+#    古いバイナリのまま起動すると、新 API が「404 page not found」になる
+make -C wasm_runner install
 ```
 
-`cache/wasm-runner`（ビルド済みバイナリ）はそのまま使い回せるので消さなくてよい
-（消してしまった場合は手順 4 で再ビルド）。手元の鍵ファイル（`owner.pem` など）も
-削除不要で、再利用しても新しく `keygen` し直してもよい。
+`wasm_runner/` のソースに変更がなければ手順 4 は省略してよい（`cache/wasm-runner` は
+そのまま使い回せる）。迷ったら再ビルドしておくのが安全。手元の鍵ファイル
+（`owner.pem` など）は削除不要で、再利用しても新しく `keygen` し直してもよい。
 
 ## テスト
 
@@ -292,3 +297,8 @@ docker run --rm -v "$PWD":/work -w /work golang:1.25-bookworm go test ./... -cou
   `timeout` コマンドで起動した場合、SIGTERM が効かずプロセスが残ることがあるため注意。
 - `docker: permission denied` → `usermod -aG docker` 後に再ログインしていない。
   `sudo docker ...` で回避するか、シェルを開き直す。
+- 存在するはずの API（`/owner` など）が `404 page not found` → `cache/wasm-runner` が
+  古い（ソース更新後に再ビルドしていない）。`GET /` の応答に列挙されるエンドポイント
+  一覧で世代を確認できる。`make -C wasm_runner install` で再ビルドし、`make clean` →
+  マニフェスト再生成 → 再起動する（SGX はバイナリのハッシュが署名に含まれるため
+  再生成必須）。
